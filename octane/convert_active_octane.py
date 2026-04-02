@@ -239,6 +239,7 @@ if hasattr(mat, 'node_tree'):
         Cycles_Invert_Nodes = [node for node in c_nodes_tree.nodes if node.bl_idname.startswith("ShaderNodeInvert")]
         Cycles_Normal_Nodes = [node for node in c_nodes_tree.nodes if node.bl_idname.startswith("ShaderNodeNormalMap")]
         Cycles_Displacement = [node for node in c_nodes_tree.nodes if node.bl_idname.startswith("ShaderNodeDisplacement")]
+        Cycles_Separate_Color = [node for node in c_nodes_tree.nodes if node.bl_idname in ("ShaderNodeSeparateColor", "ShaderNodeSeparateRGB")]
         Displacement_texture = [node for node in nodes if node.bl_idname.startswith("OctaneRGBImage") and node.label == "Displacement"]
         Displacement_node = [node for node in nodes if ("OctaneTextureDisplacement" in node.bl_idname or "OctaneVertexDisplacement" in node.bl_idname) and ("Displacement" in node.label or "COLOR * AO" in node.label)]
         Cycles_curves = [node for node in nodes if node.bl_idname == "ShaderNodeRGBCurve"]
@@ -557,7 +558,7 @@ if hasattr(mat, 'node_tree'):
         for Cycles_Images in Cycles_Images_nodes:
             Convert_image_node(Cycles_Images,mat)
            
-        # Invert Node       
+        # Invert Node
         for Cycles_invert in Cycles_Invert_Nodes:
             existing_Octane_Invert = None
             for n in c_nodes_tree.nodes:
@@ -566,10 +567,23 @@ if hasattr(mat, 'node_tree'):
                     break
             if not existing_Octane_Invert:
                 existing_Octane_Invert = c_nodes_tree.nodes.new("OctaneInvertTexture")
-                
+
             existing_Octane_Invert.location = (Cycles_invert.location[0] + 1650, Cycles_invert.location[1])
             existing_Octane_Invert.label = Cycles_invert.label
-            
+
+        # Separate Color Node
+        for Cycles_separate in Cycles_Separate_Color:
+            existing_Octane_Channel_Picker = None
+            for n in c_nodes_tree.nodes:
+                if n.bl_idname == "OctaneChannelPicker" and n.label == Cycles_separate.label:
+                    existing_Octane_Channel_Picker = n
+                    break
+            if not existing_Octane_Channel_Picker:
+                existing_Octane_Channel_Picker = c_nodes_tree.nodes.new("OctaneChannelPicker")
+
+            existing_Octane_Channel_Picker.location = (Cycles_separate.location[0] + 1650, Cycles_separate.location[1])
+            existing_Octane_Channel_Picker.label = Cycles_separate.label
+
         #Mix color Node
         for Cycles_mix_color_node in Cycles_Color_Mix:
             

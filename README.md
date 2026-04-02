@@ -212,7 +212,7 @@ This project is licensed under the GNU General Public License v3.0 - see the [LI
 
 **Adam Zorian Radziszewski**
 
-- GitHub: [@yourusername](https://github.com/yourusername)
+
 
 ---
 

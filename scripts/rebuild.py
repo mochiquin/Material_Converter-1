@@ -16,7 +16,7 @@ def rebuild_octane_connections(mat):
 
     # Dictionary mapping Cycles node types to LuxCore node types
     node_mapping = {
-    "ShaderNodeMix": ["OctaneMixTexture","OctaneCyclesMixColorNodeWrapper","OctaneCyclesMixFloatNodeWrapper","OctaneCyclesMixFloat3NodeWrapper"], 
+    "ShaderNodeMix": ["OctaneMixTexture","OctaneCyclesMixColorNodeWrapper","OctaneCyclesMixFloatNodeWrapper","OctaneCyclesMixFloat3NodeWrapper"],
     "ShaderNodeTexImage": ["OctaneRGBImage"],
     "ShaderNodeNormalMap": ["LuxCoreNodeTexNormalmap"],
     "ShaderNodeOutputMaterial": ["LuxCoreNodeMatOutput"],
@@ -30,6 +30,8 @@ def rebuild_octane_connections(mat):
     "ShaderNodeBump": ["LuxCoreNodeTexBump"],
     "ShaderNodeInvert": ["OctaneInvertTexture"],
     "ShaderNodeRGBCurve": ["NodeReroute"],
+    "ShaderNodeSeparateColor": ["OctaneChannelPicker"],
+    "ShaderNodeSeparateRGB": ["OctaneChannelPicker"],
     }
 
     # Output socket name mapping
