@@ -1081,3 +1081,19 @@ def convert_material_to_octane(mat):
     rebuild_octane_separate_color_connections(mat)
     Connect_Vray_Mapping_Node(mat)
     Connect_Alpha_Clip_Texture(mat)
+
+    # "Ignore Alpha/Opacity Channel" final override. Several of the passes above
+    # (Connect_To_Material's label matching, rebuild_octane_connections' generic
+    # Alpha -> Opacity mapping, the node-group Principled unpacking code) can all
+    # independently land a link on Opacity - rather than gate every one of them,
+    # just strip whatever ended up on Opacity here and force it fully opaque.
+    if preferences.octane_preferences.octane_ignore_alpha_clip:
+        for n in c_nodes_tree.nodes:
+            if n.bl_idname.startswith("Octane") and "Opacity" in n.inputs:
+                opacity_input = n.inputs["Opacity"]
+                while opacity_input.is_linked:
+                    links.remove(opacity_input.links[0])
+                try:
+                    opacity_input.default_value = 1.0
+                except Exception:
+                    pass

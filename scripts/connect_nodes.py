@@ -784,8 +784,15 @@ def Connect_Alpha_Clip_Texture(mat):
 
     Must run AFTER rebuild_octane_connections()/Connect_To_Material(), since it
     intentionally overrides whatever (partial or wrong) link those left on Opacity.
+
+    Skipped entirely if the user enabled "Ignore Alpha/Opacity Channel" in the
+    Octane preferences - the material is then left fully opaque.
     """
     if bpy.context.scene.render.engine != 'octane':
+        return
+
+    preferences = bpy.context.preferences.addons["Material_Converter 1"].preferences
+    if preferences.octane_preferences.octane_ignore_alpha_clip:
         return
 
     node_tree = mat.node_tree

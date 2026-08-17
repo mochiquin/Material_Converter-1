@@ -53,6 +53,12 @@ class OctanePreferences(PropertyGroup):
         min=0.0,
         max=1.0
     )
+    octane_ignore_alpha_clip: BoolProperty(
+        name="Ignore Alpha/Opacity Channel",
+        description="Skip connecting the source image's alpha channel to Opacity during conversion "
+                    "(e.g. glTF alpha-mask setups). The material is left fully opaque instead",
+        default=False
+    )
     octane_BRDF: EnumProperty(
         name="Diffuse BRDF model",
         description="Select BRDF model type for Octane",
@@ -276,6 +282,7 @@ class OctanePreferences(PropertyGroup):
         box.prop(self, "octane_base_specular")
         box.prop(self, "octane_base_roughness")
         box.prop(self, "octane_BRDF")
+        box.prop(self, "octane_ignore_alpha_clip")
         if octane_universal == "UNIVERSAL":
             box.prop(self, "octane_transmission")
             box.prop(self, "octane_metallic_type")
