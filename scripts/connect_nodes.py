@@ -771,6 +771,73 @@ def Connect_To_Material(mat):
                                     
 
 
+def Connect_Alpha_Clip_Texture(mat):
+    """
+    Bypass alpha-mask logic entirely (Less Than / Subtract / Compare / etc. chains
+    Blender's glTF importer builds for KHR_materials_alphaMode = MASK): if a
+    Principled BSDF's Alpha input traces back - through any chain of nodes - to a
+    Cycles Image Texture, connect that image's Octane counterpart's "Texture out"
+    directly to the Octane material's Opacity input. Octane reads a PNG's alpha
+    channel automatically from the plain texture output, so none of the cutoff
+    comparison logic needs to be reproduced (and most of it can't be - see the
+    Math node notes in convert_active_octane.py).
+
+    Must run AFTER rebuild_octane_connections()/Connect_To_Material(), since it
+    intentionally overrides whatever (partial or wrong) link those left on Opacity.
+    """
+    if bpy.context.scene.render.engine != 'octane':
+        return
+
+    node_tree = mat.node_tree
+    if not node_tree:
+        return
+    nodes = node_tree.nodes
+    links = node_tree.links
+
+    def find_source_image(input_socket, visited=None, depth=0):
+        if visited is None:
+            visited = set()
+        if not input_socket.is_linked or depth > 12:
+            return None
+        from_node = input_socket.links[0].from_node
+        if id(from_node) in visited:
+            return None
+        visited.add(id(from_node))
+        if from_node.bl_idname == "ShaderNodeTexImage":
+            return from_node
+        for inp in from_node.inputs:
+            if inp.is_linked:
+                found = find_source_image(inp, visited, depth + 1)
+                if found:
+                    return found
+        return None
+
+    principled_nodes = [n for n in nodes if n.bl_idname == "ShaderNodeBsdfPrincipled"]
+    for principled in principled_nodes:
+        alpha_input = principled.inputs.get("Alpha")
+        if not alpha_input or not alpha_input.is_linked:
+            continue
+
+        image_node = find_source_image(alpha_input)
+        if not image_node:
+            continue
+
+        octane_image = next((n for n in nodes if n.bl_idname == "OctaneRGBImage" and n.label == image_node.label), None)
+        if not octane_image:
+            continue
+
+        octane_material = next((n for n in nodes if n.label == principled.label and "Opacity" in n.inputs), None)
+        if not octane_material:
+            # Fallback for the rare case the label match misses (e.g. multiple
+            # Principled BSDFs sharing a label) - grab any Octane material node.
+            octane_material = next((n for n in nodes if n.bl_idname in ("OctaneUniversalMaterial", "OctaneStandardSurfaceMaterial") and "Opacity" in n.inputs), None)
+        if not octane_material:
+            continue
+
+        links.new(octane_image.outputs[0], octane_material.inputs["Opacity"])
+        print(f"Alpha-clip bypass: connected '{octane_image.name}' Texture out -> '{octane_material.name}' Opacity")
+
+
 def reorganize_material_nodes(mat,Render_Engine):
     # Get active material
     

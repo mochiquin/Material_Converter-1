@@ -358,6 +358,13 @@ def copy_node_properties(src_node, dst_node):
         elif src_node.bl_idname == "ShaderNodeMath":
             if hasattr(src_node, 'operation'):
                 dst_node.operation = src_node.operation
+            if hasattr(src_node, 'use_clamp'):
+                dst_node.use_clamp = src_node.use_clamp
+
+        # Vector Math node
+        elif src_node.bl_idname == "ShaderNodeVectorMath":
+            if hasattr(src_node, 'operation'):
+                dst_node.operation = src_node.operation
 
         # Mix node
         elif src_node.bl_idname in ("ShaderNodeMix", "ShaderNodeMixRGB"):

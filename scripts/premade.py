@@ -125,10 +125,25 @@ def set_labels_recursive(node, label_prefix):
     # Ustaw etykietę tylko jeśli jej nie ma
     if not node.label:
         node.label = f"{label_prefix}"
-   
+
     # Przechodź przez podłączone węzły
-    for input in node.inputs:
-        if input.is_linked:
+    linked_inputs = [input for input in node.inputs if input.is_linked]
+    if len(linked_inputs) > 1:
+        # More than one branch feeds this node (e.g. both Value inputs of a
+        # Math node, or two Vector inputs of a Vector Math node). Every
+        # renderer's rebuild_*_connections() pairs up Cycles <-> engine nodes
+        # by matching bl_idname + label, so if every branch inherited the
+        # exact same label_prefix here, two different upstream nodes would
+        # end up with identical labels and the connection step can no longer
+        # tell them apart (it just grabs the first label match every time).
+        # Suffix each branch with its socket identifier - same idea as the
+        # ShaderNodeMix 'A'/'B' special case above, just generalized.
+        for input in linked_inputs:
+            link = input.links[0]
+            branch_suffix = input.identifier or input.name
+            set_labels_recursive(link.from_node, f"{label_prefix} {branch_suffix}")
+    else:
+        for input in linked_inputs:
             link = input.links[0]
             set_labels_recursive(link.from_node, label_prefix)
 

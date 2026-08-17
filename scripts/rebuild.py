@@ -30,9 +30,21 @@ def rebuild_octane_connections(mat):
     "ShaderNodeBump": ["LuxCoreNodeTexBump"],
     "ShaderNodeInvert": ["OctaneInvertTexture"],
     "ShaderNodeRGBCurve": ["NodeReroute"],
-    "ShaderNodeSeparateColor": ["OctaneChannelPicker"],
-    "ShaderNodeSeparateRGB": ["OctaneChannelPicker"],
+    # OctaneCyclesNodeMathNodeWrapper / OctaneCyclesNodeVectorMathNodeWrapper exist in
+    # the API and have matching sockets, but confirmed by real-render testing to NOT
+    # actually evaluate in Octane - they're not usable. Only Add/Subtract/Multiply have
+    # a confirmed-working, texture-domain native equivalent; everything else (Divide,
+    # Less Than, Power, ...) has no known working node yet and is intentionally left
+    # unconverted (see the Math Node block in convert_*_octane.py).
+    "ShaderNodeMath": ["OctaneAddTexture", "OctaneSubtractTexture", "OctaneMultiplyTexture"],
+    "ShaderNodeRGB": ["OctaneRGBColor"],
+    "ShaderNodeValue": ["OctaneFloatValue"],
     }
+    # Note: ShaderNodeSeparateColor / ShaderNodeSeparateRGB are intentionally NOT
+    # in this table. A single Cycles Separate node can drive up to 3 downstream
+    # connections (R/G/B), but OctaneChannelPicker only has one output, so it
+    # needs a dedicated 1-cycles-node -> N-octane-nodes wiring pass. See
+    # rebuild_octane_separate_color_connections() below.
 
     # Output socket name mapping
     output_mapping = {
@@ -95,11 +107,27 @@ def rebuild_octane_connections(mat):
                                 
                                 if octane_target_node:
                                     # Determine output and input socket names
-                                    output_name = output_mapping.get(output.name, output.name)
+                                    if cycles_node.bl_idname == "ShaderNodeMath":
+                                        # OctaneAddTexture/SubtractTexture/MultiplyTexture all output
+                                        # "Texture out", regardless of Blender's socket name ("Value").
+                                        output_name = "Texture out"
+                                    elif cycles_node.bl_idname == "ShaderNodeValue":
+                                        # OctaneFloatValue's only output is "Float out", not "Texture out".
+                                        output_name = "Float out"
+                                    else:
+                                        output_name = output_mapping.get(output.name, output.name)
                                     input_socket = link.to_socket
-                                    
+
                                     # Custom input name mapping logic
-                                    if target_node.bl_idname == "ShaderNodeMixShader":
+                                    if target_node.bl_idname == "ShaderNodeMath":
+                                        # Blender's Math node exposes 2-3 inputs that are all
+                                        # literally named "Value" - only .identifier tells them apart.
+                                        # OctaneAdd/Subtract/MultiplyTexture only take 2 (no 3rd
+                                        # operand), which is fine since only Add/Subtract/Multiply
+                                        # are converted at all.
+                                        math_identifier_map = {'Value': 'Texture 1', 'Value_001': 'Texture 2'}
+                                        input_name = math_identifier_map.get(input_socket.identifier, input_socket.name)
+                                    elif target_node.bl_idname == "ShaderNodeMixShader":
                                         input_name = "First material" if input_socket.identifier == "Shader" else "Second material" if input_socket.identifier == "Shader_001" else input_socket.name
                                         if input_socket.name == "Fac":
                                             input_name = "Amount"
@@ -179,9 +207,80 @@ def rebuild_octane_connections(mat):
                                     # Create link in LuxCore node tree
                                     if output_socket and input_socket:
                                         octane_links.new(input_socket, output_socket)
-                                        
-                                        
 
+
+
+
+def rebuild_octane_separate_color_connections(mat):
+    """
+    Wire up the OctaneChannelPicker node(s) created for each Cycles
+    ShaderNodeSeparateColor / ShaderNodeSeparateRGB node.
+
+    This can't go through rebuild_octane_connections()'s generic 1-cycles-node
+    -> 1-octane-node loop because a single Separate node can drive up to 3
+    independent downstream connections (R/G/B), while OctaneChannelPicker only
+    has one output. The octane/convert_*_octane.py scripts create one
+    OctaneChannelPicker per USED output, named "<cycles_node.name>__ch<index>"
+    (index 0/1/2 = R/G/B), before this function runs.
+    """
+    node_tree = mat.node_tree
+    nodes = node_tree.nodes
+    links = node_tree.links
+
+    separate_nodes = [n for n in nodes if n.bl_idname in ("ShaderNodeSeparateColor", "ShaderNodeSeparateRGB")]
+
+    for sep_node in separate_nodes:
+        # Find the Octane equivalent feeding the Separate node's single "Color"/"Image" input
+        octane_source_node = None
+        octane_source_output_name = None
+        if sep_node.inputs[0].is_linked:
+            source_node = sep_node.inputs[0].links[0].from_node
+            for n in nodes:
+                if n.label == source_node.label and n.bl_idname.startswith("Octane"):
+                    octane_source_node = n
+                    break
+            if octane_source_node:
+                octane_source_output_name = "Texture out" if "Texture out" in octane_source_node.outputs else octane_source_node.outputs[0].name
+
+        for i in range(min(3, len(sep_node.outputs))):
+            out_socket = sep_node.outputs[i]
+            if not out_socket.is_linked:
+                continue
+
+            picker = nodes.get(f"{sep_node.name}__ch{i}")
+            if not picker:
+                continue
+
+            if octane_source_node:
+                links.new(octane_source_node.outputs[octane_source_output_name], picker.inputs["Input"])
+
+            for link in out_socket.links:
+                target_node = link.to_node
+                input_socket = link.to_socket
+
+                octane_target_node = None
+                for n in nodes:
+                    if n.label == target_node.label and n.bl_idname.startswith("Octane"):
+                        octane_target_node = n
+                        break
+                if not octane_target_node:
+                    continue
+
+                if target_node.bl_idname == "ShaderNodeMath":
+                    math_identifier_map = {'Value': 'Texture 1', 'Value_001': 'Texture 2'}
+                    input_name = math_identifier_map.get(input_socket.identifier, input_socket.name)
+                elif target_node.bl_idname == "ShaderNodeBsdfPrincipled" and octane_target_node.bl_idname == "OctaneStandardSurfaceMaterial":
+                    principled_to_standard = {
+                        'Base Color': 'Base color', 'Metallic': 'Metalness', 'Roughness': 'Specular roughness',
+                        'Specular IOR Level': 'Specular weight', 'Normal': 'Normal',
+                    }
+                    input_name = principled_to_standard.get(input_socket.name, input_socket.name)
+                else:
+                    input_name = input_socket.name
+
+                target_input = octane_target_node.inputs.get(input_name)
+                if target_input:
+                    links.new(picker.outputs["Texture out"], target_input)
 
 
 def rebuild_vray_connections(mat):
