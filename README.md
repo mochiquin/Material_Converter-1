@@ -6,7 +6,7 @@
 
 [![Blender](https://img.shields.io/badge/Blender-4.2%2B-orange.svg)](https://www.blender.org/)
 [![Version](https://img.shields.io/badge/version-1.0.8-blue.svg)](https://github.com/mochiquin/Material_Converter-1)
-[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-GPL--3.0-green.svg)](LICENSE)
 
 </div>
 
@@ -250,8 +250,11 @@ for a currently-unsupported operation, please open an issue or PR with the node'
 
 ## 📝 License
 
-This project is licensed under the MIT License - see [LICENSE](LICENSE) for the
-full text.
+This project is licensed under the GNU General Public License v3.0, the same
+license as the original add-on. See [LICENSE](LICENSE) for the full text.
+
+- Copyright (C) 2025-2026 Adam Zorian Radziszewski (original add-on)
+- Copyright (C) 2026 mochiquin (modifications in this fork)
 
 ---
 
@@ -259,6 +262,14 @@ full text.
 
 - Original author: **Adam Zorian Radziszewski**
 - Fork maintained by: **[mochiquin](https://github.com/mochiquin)**
+
+### Changes in this fork
+
+- Octane conversion for Math, RGB and Value nodes
+- Fix for alpha-clip handling in Octane materials
+- An option to ignore alpha in Octane conversion
+- Refactor of the conversion core
+- Rewritten README documenting Octane node coverage and known limitations
 
 ---
 
