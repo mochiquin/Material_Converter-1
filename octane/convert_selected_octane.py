@@ -46,4 +46,10 @@ for obj in objects:
         if is_octane_converted(mat):
             continue
 
-        convert_material_to_octane(mat)
+        # One broken material must not abort the rest of the selection.
+        try:
+            convert_material_to_octane(mat)
+        except Exception:
+            import traceback
+            print(f"[Material Converter] Failed to convert '{mat.name}':")
+            traceback.print_exc()
