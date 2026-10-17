@@ -1,7 +1,10 @@
 import bpy
 import os
+import io
 import math
 import sys
+import time
+import contextlib
 
 ## Import ##
 script_folder = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "scripts"))
@@ -246,7 +249,31 @@ def ensure_main_material(mat, preferences, chosen_material):
     output.location = (new_node.location[0] + 300, new_node.location[1])
 
 
+# Set True to get the full per-node debug output while converting. Left off
+# because ~150 prints per material is slow on Blender's Windows console.
+VERBOSE = False
+
+
 def convert_material_to_octane(mat):
+    """Wrapper around _convert_material_to_octane(): silences the debug prints,
+    pauses the auto-convert-image depsgraph handler (it rescans every material on
+    each node created here) and reports how long the material took."""
+    start = time.perf_counter()
+    ns = bpy.app.driver_namespace
+    ns["mc_converting"] = True
+    try:
+        if VERBOSE:
+            _convert_material_to_octane(mat)
+        else:
+            with contextlib.redirect_stdout(io.StringIO()):
+                _convert_material_to_octane(mat)
+    finally:
+        ns["mc_converting"] = False
+        name = mat.name if mat else "<none>"
+        print(f"[Material Converter] '{name}' converted in {time.perf_counter() - start:.2f}s")
+
+
+def _convert_material_to_octane(mat):
     """
     Single source of truth for "Cycles material -> Octane material" node-graph
     conversion for ONE material. convert_active_octane.py / convert_selected_octane.py
