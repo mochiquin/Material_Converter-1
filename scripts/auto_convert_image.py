@@ -101,6 +101,11 @@ def auto_convert_image_nodes(scene, depsgraph):
     if scene.render.engine != 'octane':
         return
 
+    # Material conversion in progress: it creates lots of nodes, and this handler
+    # would rescan every material after each one (and add duplicate image nodes).
+    if bpy.app.driver_namespace.get("mc_converting"):
+        return
+
     # Check all materials for new image texture nodes
     for material in bpy.data.materials:
         if not material.use_nodes or not material.node_tree:

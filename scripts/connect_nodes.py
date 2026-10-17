@@ -776,14 +776,21 @@ def Connect_Alpha_Clip_Texture(mat):
     Bypass alpha-mask logic entirely (Less Than / Subtract / Compare / etc. chains
     Blender's glTF importer builds for KHR_materials_alphaMode = MASK): if a
     Principled BSDF's Alpha input traces back - through any chain of nodes - to a
-    Cycles Image Texture, connect that image's Octane counterpart's "Texture out"
-    directly to the Octane material's Opacity input. Octane reads a PNG's alpha
-    channel automatically from the plain texture output, so none of the cutoff
-    comparison logic needs to be reproduced (and most of it can't be - see the
-    Math node notes in convert_active_octane.py).
+    Cycles Image Texture, connect the Octane material's Opacity input to that
+    image's alpha channel, so none of the cutoff comparison logic needs to be
+    reproduced (and most of it can't be - see the Math node notes in convert_core.py).
+
+    Unlike other engines (e.g. C4D), Octane does NOT read alpha off a plain
+    OctaneRGBImage's "Texture out" - only a dedicated OctaneAlphaImage node
+    (pointed at the same image file) actually detects/uses the image's alpha
+    channel. Confirmed by real-render testing, not just matching sockets - see
+    the Math node lesson. So this creates one of those, rather than reusing the
+    already-converted OctaneRGBImage node's output.
 
     Must run AFTER rebuild_octane_connections()/Connect_To_Material(), since it
-    intentionally overrides whatever (partial or wrong) link those left on Opacity.
+    intentionally overrides whatever (partial or wrong) link those left on
+    Opacity. Must run BEFORE Connect_Vray_Mapping_Node(), so the newly created
+    OctaneAlphaImage node's "UV transform" input gets wired up by that pass too.
 
     Skipped entirely if the user enabled "Ignore Alpha/Opacity Channel" in the
     Octane preferences - the material is then left fully opaque.
@@ -826,11 +833,7 @@ def Connect_Alpha_Clip_Texture(mat):
             continue
 
         image_node = find_source_image(alpha_input)
-        if not image_node:
-            continue
-
-        octane_image = next((n for n in nodes if n.bl_idname == "OctaneRGBImage" and n.label == image_node.label), None)
-        if not octane_image:
+        if not image_node or not image_node.image:
             continue
 
         octane_material = next((n for n in nodes if n.label == principled.label and "Opacity" in n.inputs), None)
@@ -841,8 +844,21 @@ def Connect_Alpha_Clip_Texture(mat):
         if not octane_material:
             continue
 
-        links.new(octane_image.outputs[0], octane_material.inputs["Opacity"])
-        print(f"Alpha-clip bypass: connected '{octane_image.name}' Texture out -> '{octane_material.name}' Opacity")
+        alpha_image_name = f"{image_node.name} [Octane Alpha Image]"
+        octane_alpha_image = nodes.get(alpha_image_name)
+        if not octane_alpha_image:
+            octane_alpha_image = nodes.new("OctaneAlphaImage")
+            octane_alpha_image.name = alpha_image_name
+            octane_alpha_image.location = (octane_material.location[0] - 300, octane_material.location[1] - 300)
+
+        octane_alpha_image.label = f"{image_node.label} Alpha".strip() if image_node.label else "Alpha"
+        octane_alpha_image.image = image_node.image
+        # Alpha is never color data - always read it as linear/raw, regardless of
+        # the RGB image's own colorspace setting.
+        octane_alpha_image.inputs["Legacy gamma"].default_value = 1.0
+
+        links.new(octane_alpha_image.outputs[0], octane_material.inputs["Opacity"])
+        print(f"Alpha-clip bypass: connected new OctaneAlphaImage '{octane_alpha_image.name}' -> '{octane_material.name}' Opacity")
 
 
 def reorganize_material_nodes(mat,Render_Engine):

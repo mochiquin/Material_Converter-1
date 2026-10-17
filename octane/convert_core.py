@@ -1,7 +1,10 @@
 import bpy
 import os
+import io
 import math
 import sys
+import time
+import contextlib
 
 ## Import ##
 script_folder = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "scripts"))
@@ -180,7 +183,97 @@ def Convert_Standard_Material(cycles_principled, c_nodes_tree, preferences):
     return Universal_node
 
 
+def is_octane_converted(mat):
+    """True only if the material already has an Octane *material* node (e.g.
+    OctaneUniversalMaterial). Octane texture/helper nodes alone (left by the
+    drag-in auto-convert or a half-finished earlier run) don't count - such
+    materials still need converting, otherwise they end up with no main material."""
+    return any(
+        n.bl_idname.startswith("Octane") and n.bl_idname.endswith("Material")
+        for n in mat.node_tree.nodes
+    )
+
+
+def _is_octane_material_node(node):
+    return node.bl_idname.startswith("Octane") and node.bl_idname.endswith("Material")
+
+
+def ensure_main_material(mat, preferences, chosen_material):
+    """Last-resort safety net: guarantee the material ends up with an Octane main
+    material node wired to a Material Output. The normal passes only build one from
+    a Principled BSDF, so materials made of Diffuse/Emission/Glossy BSDFs only (or
+    ones where an earlier pass bailed out) would otherwise convert to nothing."""
+    tree = mat.node_tree
+    nodes, links = tree.nodes, tree.links
+
+    outputs = [n for n in nodes if n.bl_idname == "ShaderNodeOutputMaterial"]
+    output = next((n for n in outputs if n.label == "Octane Output"), None)
+    if output is None:
+        output = next((n for n in outputs if not n.inputs[0].is_linked), None)
+    if output is None:
+        output = nodes.new("ShaderNodeOutputMaterial")
+        output.label = "Octane Output"
+        output.target = "ALL"
+        if outputs:
+            output.location = (outputs[0].location[0], outputs[0].location[1] - 300)
+
+    if output.inputs[0].is_linked and _is_octane_material_node(output.inputs[0].links[0].from_node):
+        return
+
+    # An Octane material exists but isn't hooked up: just wire it in.
+    existing = next((n for n in nodes if _is_octane_material_node(n)), None)
+    if existing is not None:
+        links.new(existing.outputs[0], output.inputs[0])
+        return
+
+    # Nothing at all: build one from the colour of whatever simple BSDF is there.
+    color = None
+    for n in nodes:
+        if n.bl_idname in ("ShaderNodeBsdfDiffuse", "ShaderNodeEmission", "ShaderNodeBsdfGlossy",
+                           "ShaderNodeBsdfTranslucent", "ShaderNodeBsdfGlass") and "Color" in n.inputs:
+            color = n.inputs["Color"].default_value[:]
+            break
+
+    temp = nodes.new("ShaderNodeBsdfPrincipled")
+    temp.location = (output.location[0] - 1950, output.location[1])
+    if color is not None:
+        temp.inputs["Base Color"].default_value = color
+    try:
+        if chosen_material == "UNIVERSAL":
+            new_node = Convert_Universal_Material(temp, tree, preferences)
+        else:
+            new_node = Convert_Standard_Material(temp, tree, preferences)
+    finally:
+        nodes.remove(temp)
+    links.new(new_node.outputs[0], output.inputs[0])
+    output.location = (new_node.location[0] + 300, new_node.location[1])
+
+
+# Set True to get the full per-node debug output while converting. Left off
+# because ~150 prints per material is slow on Blender's Windows console.
+VERBOSE = False
+
+
 def convert_material_to_octane(mat):
+    """Wrapper around _convert_material_to_octane(): silences the debug prints,
+    pauses the auto-convert-image depsgraph handler (it rescans every material on
+    each node created here) and reports how long the material took."""
+    start = time.perf_counter()
+    ns = bpy.app.driver_namespace
+    ns["mc_converting"] = True
+    try:
+        if VERBOSE:
+            _convert_material_to_octane(mat)
+        else:
+            with contextlib.redirect_stdout(io.StringIO()):
+                _convert_material_to_octane(mat)
+    finally:
+        ns["mc_converting"] = False
+        name = mat.name if mat else "<none>"
+        print(f"[Material Converter] '{name}' converted in {time.perf_counter() - start:.2f}s")
+
+
+def _convert_material_to_octane(mat):
     """
     Single source of truth for "Cycles material -> Octane material" node-graph
     conversion for ONE material. convert_active_octane.py / convert_selected_octane.py
@@ -225,6 +318,9 @@ def convert_material_to_octane(mat):
     Cycles_Node_Group = [node for node in c_nodes if node.bl_idname == "ShaderNodeGroup"]
     print(f"=== DEBUG: Found {len(Cycles_Node_Group)} node groups in material ===")
     Cycles_Images_nodes = [node for node in c_nodes_tree.nodes if node.bl_idname.startswith("ShaderNodeTexImage")]
+    # A material with no Material Output node would leave Octane_Output undefined below.
+    if not any(node.bl_idname == "ShaderNodeOutputMaterial" for node in c_nodes_tree.nodes):
+        c_nodes_tree.nodes.new("ShaderNodeOutputMaterial")
     Cycles_Output_nodes = [node for node in c_nodes_tree.nodes if node.bl_idname.startswith("ShaderNodeOutputMaterial")]
     Cycles_Translusency_nodes = [node for node in c_nodes_tree.nodes if node.bl_idname.startswith("ShaderNodeBsdfTranslucent")]
     Cycles_principled_nodes = [node for node in c_nodes_tree.nodes if node.bl_idname.startswith("ShaderNodeBsdfPrincipled")]
@@ -1066,6 +1162,8 @@ def convert_material_to_octane(mat):
 
                 Octane_Output.location = (Universal_node.location[0] + 300, Universal_node.location[1])
 
+    ensure_main_material(mat, preferences, Chosen_material)
+
     # Znalezienie wszystkich węzłów typu ShaderNodeOutputMaterial
     Cycles_Output_nodes = [node for node in c_nodes_tree.nodes if node.bl_idname.startswith("ShaderNodeOutputMaterial")]
 
@@ -1079,8 +1177,10 @@ def convert_material_to_octane(mat):
     Connect_To_Material(mat)
     rebuild_octane_connections(mat)
     rebuild_octane_separate_color_connections(mat)
-    Connect_Vray_Mapping_Node(mat)
+    # Must run before Connect_Vray_Mapping_Node() so the OctaneAlphaImage node it
+    # may create gets its "UV transform" input wired up by that pass too.
     Connect_Alpha_Clip_Texture(mat)
+    Connect_Vray_Mapping_Node(mat)
 
     # "Ignore Alpha/Opacity Channel" final override. Several of the passes above
     # (Connect_To_Material's label matching, rebuild_octane_connections' generic
