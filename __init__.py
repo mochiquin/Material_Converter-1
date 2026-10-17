@@ -17,6 +17,7 @@ import sys
 import zipfile
 import importlib
 import importlib.util
+import traceback
 from .operators import register_operators, unregister_operators
 from .scripts import *
 from bpy.props import StringProperty, EnumProperty, BoolProperty, FloatProperty, IntProperty, FloatVectorProperty
@@ -27,6 +28,13 @@ from .preferences.octane_preferences import OctanePreferences
 from .preferences.vray_preferences import VRayPreferences
 
 from typing import Dict, Any, Tuple
+
+# Engines whose convert_all_<engine>.py exposes get_materials_to_convert() /
+# convert_material_to_<engine>() so "Convert all" can run incrementally with a
+# progress bar (MATERIAL_OT_convert_all) instead of one blocking loop over
+# every material. Add an engine here once its convert_all_<engine>.py has been
+# refactored the same way convert_all_octane.py was.
+INCREMENTAL_BULK_ENGINES = {'OCTANE'}
 
 def get_addon_preferences(addon_name="Material_Converter 1"):
     """Get the addon preferences object."""
@@ -618,6 +626,153 @@ class MATERIAL_OT_convert(Operator, BaseConvertOperator):
         return {'FINISHED'}
 
 
+class MATERIAL_OT_convert_all(Operator, BaseConvertOperator):
+    """'Convert all' used to run every material through one uninterrupted
+    Python loop, which froze Blender's UI on files with many materials (no
+    redraws happen while a single execute() call is running). This operator
+    instead runs as a modal timer: it converts a small batch of materials per
+    tick, updates a progress bar between batches, and lets Blender's event
+    loop breathe so the window stays responsive and shows real progress."""
+    bl_idname = "material.convert_all"
+    bl_label = "Convert All Materials"
+    bl_description = "Convert materials (shows progress and stays responsive on large scenes)"
+
+    engine: StringProperty()
+
+    # Materials processed per timer tick. Small enough to keep the UI
+    # responsive between ticks, large enough to not waste time on Blender's
+    # own timer/redraw overhead.
+    batch_size = 10
+
+    _timer = None
+    _materials = None
+    _index = 0
+    _total = 0
+    _module = None
+    _convert_fn = None
+    _cancelled = False
+
+    def invoke(self, context, event):
+        script_base = "convert_all"
+        regular_script_name = f"{script_base}.py"
+
+        if not self.is_converter_available(context, self.engine, regular_script_name):
+            bpy.ops.material.premium_feature_info('INVOKE_DEFAULT',
+                feature_type="all materials",
+                engine=self.engine)
+            return {'CANCELLED'}
+
+        # NOTE: load_converter() executes the module's top-level code (that's
+        # how these engine scripts have always worked), so for an engine whose
+        # convert_all_<engine>.py hasn't been split into
+        # get_materials_to_convert()/convert_material_to_<engine>() yet, the
+        # blocking conversion already happened by the time we get the module
+        # back below - there is no safe "fall back to the old operator" path
+        # here without doing that work twice. Only wire this operator's UI
+        # button up for engines that expose the incremental functions.
+        module = self.load_converter(self.get_module_path(context, self.engine), regular_script_name)
+        convert_fn = getattr(module, f"convert_material_to_{self.engine.lower()}", None) if module else None
+
+        if not module or not hasattr(module, "get_materials_to_convert") or not convert_fn:
+            self.report({'ERROR'}, f"{self.engine} does not support progress-tracked bulk conversion yet")
+            return {'CANCELLED'}
+
+        self._module = module
+        self._convert_fn = convert_fn
+        self._materials = module.get_materials_to_convert()
+        self._total = len(self._materials)
+        self._index = 0
+        self._cancelled = False
+
+        if self._total == 0:
+            self.report({'INFO'}, "No materials to convert")
+            return {'FINISHED'}
+
+        wm = context.window_manager
+        wm.progress_begin(0, self._total)
+        self._update_status(context)
+        self._timer = wm.event_timer_add(0.01, window=context.window)
+        wm.modal_handler_add(self)
+        return {'RUNNING_MODAL'}
+
+    def modal(self, context, event):
+        if event.type == 'ESC':
+            self._cancelled = True
+            self._finish(context)
+            return {'CANCELLED'}
+
+        if event.type == 'TIMER':
+            # Whatever happens in here must not escape uncaught: an unhandled
+            # exception inside modal() makes Blender silently drop the modal
+            # handler (no dialog, no console message unless the system console
+            # is open) - the timer/progress cursor/status text are left
+            # dangling and the run just looks like it "stopped after doing
+            # part of the materials". Catch everything, clean up, and report
+            # it loudly instead.
+            try:
+                batch_end = min(self._index + self.batch_size, self._total)
+                for i in range(self._index, batch_end):
+                    mat = self._materials[i]
+                    mat_name = "<unknown>"
+                    try:
+                        mat_name = mat.name
+                        self._convert_fn(mat)
+                    except Exception as e:
+                        print(f"[Material Converter] Failed to convert '{mat_name}':")
+                        traceback.print_exc()
+                        self.report({'WARNING'}, f"Failed to convert '{mat_name}': {e}")
+                self._index = batch_end
+
+                context.window_manager.progress_update(self._index)
+                self._update_status(context)
+            except Exception as e:
+                print("[Material Converter] Convert All aborted by an unexpected error:")
+                traceback.print_exc()
+                self.report({'ERROR'}, f"Conversion stopped unexpectedly after {self._index}/{self._total} materials: {e}")
+                self._finish(context, report=False)
+                return {'CANCELLED'}
+
+            if self._index >= self._total:
+                self._finish(context)
+                return {'FINISHED'}
+
+        return {'PASS_THROUGH'}
+
+    def _update_status(self, context):
+        context.workspace.status_text_set(
+            f"Converting materials to {self.engine}: {self._index}/{self._total} (Esc to cancel)")
+        screen = getattr(context, "screen", None)
+        if screen:
+            for area in screen.areas:
+                area.tag_redraw()
+
+    def _finish(self, context, report=True):
+        wm = context.window_manager
+        try:
+            wm.progress_end()
+        except Exception:
+            pass
+        if self._timer:
+            wm.event_timer_remove(self._timer)
+            self._timer = None
+        try:
+            context.workspace.status_text_set(None)
+        except Exception:
+            pass
+
+        if not report:
+            return
+        if self._cancelled:
+            self.report({'WARNING'}, f"Conversion cancelled after {self._index}/{self._total} materials")
+        else:
+            self.report({'INFO'}, f"Conversion completed: {self._index}/{self._total} materials converted")
+
+        if self._cancelled:
+            self.report({'WARNING'}, f"Conversion cancelled after {self._index}/{self._total} materials")
+        else:
+            self.report({'INFO'}, f"Conversion completed: {self._index}/{self._total} materials converted")
+
+
 def get_active_engine(context):
     """Zwraca nazwę aktywnego silnika renderowania w formacie zgodnym z naszym dodatkiem"""
     engine = context.scene.render.engine
@@ -663,31 +818,38 @@ def draw_converter_ui(layout, context):
                     script_exists = os.path.exists(os.path.join(engine_path, script_name))
 
                     row = col.row()
-                    if script_exists:
-                        if mode == "all":
-                            op = row.operator(MATERIAL_OT_convert.bl_idname, 
-                                          text=f"Convert all non-{engine_short_name} materials")
-                        elif mode == "selected":
-                            op = row.operator(MATERIAL_OT_convert.bl_idname, 
-                                          text=f"Convert all non-{engine_short_name} materials in selected object")
-                        else:
-                             op = row.operator(MATERIAL_OT_convert.bl_idname, 
-                                          text=f"Convert active material to {engine_short_name} ")
-                    else:
+                    if not script_exists:
                         row.alert = True
-                        if mode == "all":
-                            op = row.operator(MATERIAL_OT_convert.bl_idname, 
-                                          text=f"Convert all non-{engine_short_name} materials")
-                        elif mode == "selected":
-                            op = row.operator(MATERIAL_OT_convert.bl_idname, 
-                                          text=f"Convert all non-{engine_short_name} materials in selected object")
-                        else:
-                             op = row.operator(MATERIAL_OT_convert.bl_idname, 
-                                          text=f"Convert active material to {engine_short_name} ")
-                        row.alert = False
 
-                    op.engine = engine
-                    op.mode = mode
+                    # "Convert all" can touch every material in the file, which used
+                    # to freeze Blender in one long blocking loop. For engines that
+                    # expose the incremental API (currently just Octane - see
+                    # convert_all_octane.py) we run it as a modal operator with its
+                    # own progress bar instead (MATERIAL_OT_convert_all).
+                    # "selected"/"active" stay on the plain blocking operator since
+                    # they only ever touch a handful of materials.
+                    if mode == "all" and engine in INCREMENTAL_BULK_ENGINES:
+                        op = row.operator(MATERIAL_OT_convert_all.bl_idname,
+                                      text=f"Convert all non-{engine_short_name} materials")
+                        op.engine = engine
+                    elif mode == "all":
+                        op = row.operator(MATERIAL_OT_convert.bl_idname,
+                                      text=f"Convert all non-{engine_short_name} materials")
+                        op.engine = engine
+                        op.mode = mode
+                    elif mode == "selected":
+                        op = row.operator(MATERIAL_OT_convert.bl_idname,
+                                      text=f"Convert all non-{engine_short_name} materials in selected object")
+                        op.engine = engine
+                        op.mode = mode
+                    else:
+                        op = row.operator(MATERIAL_OT_convert.bl_idname,
+                                      text=f"Convert active material to {engine_short_name} ")
+                        op.engine = engine
+                        op.mode = mode
+
+                    if not script_exists:
+                        row.alert = False
                 
                 col.separator()
             #Textures tools:    
@@ -1132,6 +1294,7 @@ classes = (
     MATERIAL_OT_premium_feature,
     MATERIAL_OT_install_premium_features,
     MATERIAL_OT_convert,
+    MATERIAL_OT_convert_all,
     MATERIAL_OT_create_basic,
     MATERIAL_OT_create_trans,
     MATERIAL_OT_import_textures,

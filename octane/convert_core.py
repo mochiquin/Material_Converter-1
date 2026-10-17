@@ -180,6 +180,17 @@ def Convert_Standard_Material(cycles_principled, c_nodes_tree, preferences):
     return Universal_node
 
 
+def is_octane_converted(mat):
+    """True only if the material already has an Octane *material* node (e.g.
+    OctaneUniversalMaterial). Octane texture/helper nodes alone (left by the
+    drag-in auto-convert or a half-finished earlier run) don't count - such
+    materials still need converting, otherwise they end up with no main material."""
+    return any(
+        n.bl_idname.startswith("Octane") and n.bl_idname.endswith("Material")
+        for n in mat.node_tree.nodes
+    )
+
+
 def convert_material_to_octane(mat):
     """
     Single source of truth for "Cycles material -> Octane material" node-graph
@@ -1079,8 +1090,10 @@ def convert_material_to_octane(mat):
     Connect_To_Material(mat)
     rebuild_octane_connections(mat)
     rebuild_octane_separate_color_connections(mat)
-    Connect_Vray_Mapping_Node(mat)
+    # Must run before Connect_Vray_Mapping_Node() so the OctaneAlphaImage node it
+    # may create gets its "UV transform" input wired up by that pass too.
     Connect_Alpha_Clip_Texture(mat)
+    Connect_Vray_Mapping_Node(mat)
 
     # "Ignore Alpha/Opacity Channel" final override. Several of the passes above
     # (Connect_To_Material's label matching, rebuild_octane_connections' generic

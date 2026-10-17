@@ -9,7 +9,7 @@ if octane_folder not in sys.path:
 
 # All the actual conversion logic lives in convert_core.py, shared by
 # convert_active/selected/all_octane.py - see convert_core.py's docstring.
-from convert_core import convert_material_to_octane
+from convert_core import convert_material_to_octane, is_octane_converted
 
 Render_engine = bpy.context.scene.render.engine
 if Render_engine != 'octane':
@@ -23,19 +23,27 @@ for screen in current_workspace.screens:
         if area.type == 'NODE_EDITOR' and not area.ui_type in ["GeometryNodeTree", "CompositorNodeTree"]:
             area.ui_type = 'ShaderNodeTree'
 
-obj = bpy.context.active_object
+# Every selected object (plus the active one), not just the active object.
+objects = list(bpy.context.selected_objects)
+active = bpy.context.active_object
+if active and active not in objects:
+    objects.append(active)
 
-if obj and obj.material_slots:
+seen = set()
+for obj in objects:
     for slot in obj.material_slots:
         mat = slot.material
-        if not mat or not hasattr(mat, 'node_tree') or not mat.node_tree:
+        if not mat or mat.name in seen:
+            continue
+        seen.add(mat.name)
+        if not hasattr(mat, 'node_tree') or not mat.node_tree:
             continue
 
-        # Skip materials that already have Octane nodes - "convert selected" is a
-        # bulk operation and shouldn't keep reprocessing already-converted materials.
-        # (Unlike "convert active material", which always reconverts on purpose.)
-        already_converted = any(n.bl_idname.startswith("Octane") for n in mat.node_tree.nodes)
-        if already_converted:
+        # Skip materials that already have an Octane material node - "convert
+        # selected" is a bulk operation and shouldn't keep reprocessing
+        # already-converted materials. (Unlike "convert active material", which
+        # always reconverts on purpose.)
+        if is_octane_converted(mat):
             continue
 
         convert_material_to_octane(mat)
