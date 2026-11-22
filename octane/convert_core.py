@@ -1,6 +1,7 @@
 import contextlib
 import io
 import time
+from typing import Any
 
 import bpy
 
@@ -29,6 +30,17 @@ from ..scripts.rebuild import (
     rebuild_octane_connections,
     rebuild_octane_separate_color_connections,
 )
+
+
+def _set_input_val(node, names: str | tuple[str, ...], fallback_idx: int, val: Any) -> None:
+    """Set node input default_value by socket name(s), with fallback to index."""
+    name_tuple = (names,) if isinstance(names, str) else names
+    for name in name_tuple:
+        if name in node.inputs:
+            node.inputs[name].default_value = val
+            return
+    if 0 <= fallback_idx < len(node.inputs):
+        node.inputs[fallback_idx].default_value = val
 
 
 def Convert_Universal_Material(cycles_principled, c_nodes_tree, preferences):
@@ -74,34 +86,35 @@ def Convert_Universal_Material(cycles_principled, c_nodes_tree, preferences):
     new_shader_Thin_Film_IOR = cycles_principled.inputs["Thin Film IOR"].default_value
 
     # Diffuse:
-    Universal_node.inputs[5].default_value = new_shader_Base_color[:3]
-    #Metallic:
-    Universal_node.inputs[7].default_value = new_shader_Metallic
-    #Specular:
-    Universal_node.inputs[10].default_value = min(new_shader_Specualar*preferences.octane_preferences.octane_specular_multipler,1)
-    #Roughness
-    Universal_node.inputs[13].default_value = new_shader_Roughness
-    #Anisotropy:
-    Universal_node.inputs[14].default_value = new_shader_Anisotropic
-    #Anisotropy Rotation:
-    Universal_node.inputs[15].default_value = new_shader_Anisotropic_rotation
-    #IOR
-    Universal_node.inputs[18].default_value = new_shader_IOR
-    #Coat
+    _set_input_val(Universal_node, ("Albedo", "Diffuse"), 5, new_shader_Base_color[:3])
+    # Metallic:
+    _set_input_val(Universal_node, "Metallic", 7, new_shader_Metallic)
+    # Specular:
+    specular_val = min(new_shader_Specualar * preferences.octane_preferences.octane_specular_multipler, 1)
+    _set_input_val(Universal_node, "Specular", 10, specular_val)
+    # Roughness:
+    _set_input_val(Universal_node, "Roughness", 13, new_shader_Roughness)
+    # Anisotropy:
+    _set_input_val(Universal_node, "Anisotropy", 14, new_shader_Anisotropic)
+    # Anisotropy Rotation:
+    _set_input_val(Universal_node, ("Anisotropy Rotation", "Anisotropy rotation"), 15, new_shader_Anisotropic_rotation)
+    # IOR:
+    _set_input_val(Universal_node, ("Dielectric IOR", "IOR"), 18, new_shader_IOR)
+    # Coat:
     if new_shader_Clearcoat != 0:
-        Universal_node.inputs[26].default_value = new_shader_Clearcoat_Tilt
-        Universal_node.inputs[28].default_value = new_shader_clearcoat_IOR
-        Universal_node.inputs[27].default_value = new_shader_clearcoat_Rougness
-    #Thin Film
-    Universal_node.inputs[32].default_value = new_shader_Thin_Film_Thickness
-    Universal_node.inputs[33].default_value = new_shader_Thin_Film_IOR
+        _set_input_val(Universal_node, ("Coat Color", "Coat Tint"), 26, new_shader_Clearcoat_Tilt)
+        _set_input_val(Universal_node, "Coat Roughness", 27, new_shader_clearcoat_Rougness)
+        _set_input_val(Universal_node, "Coat IOR", 28, new_shader_clearcoat_IOR)
+    # Thin Film:
+    _set_input_val(Universal_node, ("Film Thickness", "Thin Film Thickness"), 32, new_shader_Thin_Film_Thickness)
+    _set_input_val(Universal_node, ("Film IOR", "Thin Film IOR"), 33, new_shader_Thin_Film_IOR)
 
-    #Sheen
+    # Sheen:
     if new_shader_Sheen != 0:
-        Universal_node.inputs[35].default_value = new_shader_Sheen_tilt
-        Universal_node.inputs[36].default_value = new_shader_Sheen_Roughness
-    #Opacity
-    Universal_node.inputs[43].default_value = new_shader_opacity
+        _set_input_val(Universal_node, ("Sheen Color", "Sheen Tint"), 35, new_shader_Sheen_tilt)
+        _set_input_val(Universal_node, "Sheen Roughness", 36, new_shader_Sheen_Roughness)
+    # Opacity:
+    _set_input_val(Universal_node, "Opacity", 43, new_shader_opacity)
 
     #models:
     Universal_node.inputs["[OctaneGroupTitle]Transmission Layer"].default_value = preferences.octane_preferences.octane_transmission
@@ -869,19 +882,16 @@ def _convert_material_to_octane(mat):
             Octane_Output.location = (Octane_Translusency.location[0] + 300, Octane_Translusency.location[1])
 
             if BSDF_help:
-                #Alpha
-                Octane_Translusency.inputs[43].value = BSDF_help.inputs[4].default_value
-                #Diffuse
-                Octane_Translusency.inputs[5].value = BSDF_help.inputs[0].default_value[:3]
-
-                #Glossiness
-                Octane_Translusency.inputs[13].value = BSDF_help.inputs[2].default_value
-
-                #Fresnel IOR
-                Octane_Translusency.inputs[18].value =  BSDF_help.inputs[3].default_value
-
-                #Metalness
-                Octane_Translusency.inputs[7].value =  BSDF_help.inputs[1].default_value
+                # Alpha
+                _set_input_val(Octane_Translusency, "Opacity", 43, BSDF_help.inputs["Alpha"].default_value if "Alpha" in BSDF_help.inputs else BSDF_help.inputs[4].default_value)
+                # Diffuse
+                _set_input_val(Octane_Translusency, ("Albedo", "Diffuse"), 5, BSDF_help.inputs["Base Color"].default_value[:3] if "Base Color" in BSDF_help.inputs else BSDF_help.inputs[0].default_value[:3])
+                # Glossiness / Roughness
+                _set_input_val(Octane_Translusency, "Roughness", 13, BSDF_help.inputs["Roughness"].default_value if "Roughness" in BSDF_help.inputs else BSDF_help.inputs[2].default_value)
+                # Fresnel IOR
+                _set_input_val(Octane_Translusency, ("Dielectric IOR", "IOR"), 18, BSDF_help.inputs["IOR"].default_value if "IOR" in BSDF_help.inputs else BSDF_help.inputs[3].default_value)
+                # Metalness
+                _set_input_val(Octane_Translusency, "Metallic", 7, BSDF_help.inputs["Metallic"].default_value if "Metallic" in BSDF_help.inputs else BSDF_help.inputs[1].default_value)
 
     Cycles_Glass = False
     for Cycles_Glass_node in Cycles_Glass_nodes:
@@ -909,11 +919,11 @@ def _convert_material_to_octane(mat):
             Octane_Glass.name = Octane_Glass_Name
 
 
-        Octane_Glass.inputs[2].default_value = "Specular"
-        #Diffuse
-        Octane_Glass.inputs[5].value = (0,0,0)
+        _set_input_val(Octane_Glass, ("Transmission Layer", "[OctaneGroupTitle]Transmission Layer"), 2, "Specular")
+        # Diffuse
+        _set_input_val(Octane_Glass, ("Albedo", "Diffuse"), 5, (0.0, 0.0, 0.0))
 
-        #Transmission Color:
+        # Transmission Color:
         if not Cycles_Glass_node.inputs[0].is_linked:
             Octane_Trans_Color = None
             for n in c_nodes_tree.nodes:
@@ -923,19 +933,19 @@ def _convert_material_to_octane(mat):
             if not Octane_Trans_Color:
                 Octane_Trans_Color = c_nodes_tree.nodes.new("OctaneRGBColor")
                 Octane_Trans_Color.label = "Octane Color Transmission"
-            Octane_Trans_Color.location = (Octane_Glass.location[0] -300 , Octane_Glass.location[1] -75)
+            Octane_Trans_Color.location = (Octane_Glass.location[0] - 300, Octane_Glass.location[1] - 75)
             Octane_Trans_Color.a_value = Cycles_Glass_node.inputs[0].default_value[:3]
             c_nodes_tree.links.new(Octane_Trans_Color.outputs[0], Octane_Glass.inputs[1])
-        #Glossiness
-        Octane_Glass.inputs[13].value = Cycles_Glass_node.inputs[1].default_value
+        # Roughness / Glossiness
+        _set_input_val(Octane_Glass, "Roughness", 13, Cycles_Glass_node.inputs[1].default_value)
 
-        #Octane_output
-        c_nodes_tree.links.new(Octane_Glass.outputs[0],Octane_Output.inputs[0])
+        # Octane_output
+        c_nodes_tree.links.new(Octane_Glass.outputs[0], Octane_Output.inputs[0])
 
         Octane_Output.location = (Octane_Glass.location[0] + 300, Octane_Glass.location[1])
 
-        #Fresnel IOR
-        Octane_Glass.inputs[18].value =  Cycles_Glass_node.inputs[2].default_value
+        # Fresnel IOR
+        _set_input_val(Octane_Glass, ("Dielectric IOR", "IOR"), 18, Cycles_Glass_node.inputs[2].default_value)
     if not Cycles_Glass and not Cycles_Translucent:
         last_universal_node = None
         for cycles_principled in Cycles_principled_nodes:

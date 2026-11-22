@@ -4,6 +4,10 @@ This package MUST remain strictly decoupled from Blender runtime APIs
 (no bpy, mathutils, bmesh, or executor imports).
 """
 
+from .graph_flattener import (
+    FlattenedGraphResult,
+    flatten_graph_ir,
+)
 from .graph_planner import (
     AlphaClipPlan,
     ConversionWarning,
@@ -59,6 +63,7 @@ __all__ = [
     "AlphaClipPlan",
     "BLEND_TYPE_MAPPING",
     "ConversionWarning",
+    "FlattenedGraphResult",
     "KNOWN_UNSUPPORTED_OCTANE_NODES",
     "LABEL_REMAP",
     "LINEAR_GAMMA_KEYWORDS",
@@ -87,6 +92,7 @@ __all__ = [
     "compute_octane_mapping_transform",
     "detect_auto_connect_target",
     "find_alpha_clip_source_image",
+    "flatten_graph_ir",
     "infer_octane_gamma",
     "normalize_preferences_path",
     "parse_color_repr",
