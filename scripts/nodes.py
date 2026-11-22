@@ -1,29 +1,27 @@
 # scripts/__init__.py
 import bpy
 
+from ..executor.addon_helpers import get_addon_preferences
+
+
 def setup_ao_nodes(Render_Engine, nodes, links, diffuse_texture, ao_texture, diffuse_color=None):
     
-    if Render_Engine == "octane":
-        AO_Type = "OctaneCyclesMixColorNodeWrapper"
-        ao_input1 = "A"
-        ao_input2 = "B"
-    if Render_Engine == "LUXCORE":
-        AO_Type = "LuxCoreNodeTexColorMix"
-        ao_input1 = "Color 1"
-        ao_input2 = "Color 2"
-    if Render_Engine == "CYCLES":
-        AO_Type = "ShaderNodeMix"
-        ao_input1 = 6
-        ao_input2 = 7
-    if Render_Engine == "VRAY_RENDER_RT":
-        AO_Type = "VRayNodeTexMix"
-        ao_input1 = 3
-        ao_input2 = 4
-        
-        
-    
-    ao_node = next((node for node in nodes if node.bl_idname == "AO_Type" and 
-                   ("Diffuse AO" in node.label or "COLOR * AO" in node.label)), None)
+    engine_configs = {
+        "octane": ("OctaneCyclesMixColorNodeWrapper", "A", "B"),
+        "LUXCORE": ("LuxCoreNodeTexColorMix", "Color 1", "Color 2"),
+        "CYCLES": ("ShaderNodeMix", 6, 7),
+        "VRAY_RENDER_RT": ("VRayNodeTexMix", 3, 4),
+    }
+    AO_Type, ao_input1, ao_input2 = engine_configs.get(Render_Engine, ("ShaderNodeMix", 6, 7))
+
+    ao_node = next(
+        (
+            node
+            for node in nodes
+            if node.bl_idname == AO_Type and ("Diffuse AO" in node.label or "COLOR * AO" in node.label)
+        ),
+        None,
+    )
     
     #Node Setup according to Render Engine
     if not ao_node:
@@ -227,7 +225,7 @@ def setup_disp_nodes(preferences, Render_Engine, nodes, links, Displacement_text
 
 
 def setup_disp_modifier(preferences, Render_Engine, nodes, Displacement_texture, Displacement_node):
-    Disp_settings = bpy.context.preferences.addons["Material_Converter 1"].preferences.luxcore_preferences
+    Disp_settings = get_addon_preferences().luxcore_preferences
     
     Modifiers = bpy.context.object.modifiers
 

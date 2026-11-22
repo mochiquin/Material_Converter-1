@@ -1,31 +1,22 @@
+"""Create or reset a basic Octane material on the active object."""
+
+from __future__ import annotations
+
 import bpy
-import math
-import sys
-import os
 
-#Import
-script_folder = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "scripts"))
-if script_folder not in sys.path:
-    sys.path.append(script_folder)
-
-from connect_nodes import (connect_to_closest_octane_group_node,Connect_To_Material)
-from nodes import (setup_disp_nodes,setup_ao_nodes)
-
-preferences = bpy.context.preferences.addons["Material_Converter 1"].preferences
-Render_Engine = bpy.context.scene.render.engine
+from ..executor.addon_helpers import get_addon_preferences
+from ..scripts.connect_nodes import Connect_To_Material
+from ..scripts.nodes import setup_ao_nodes, setup_disp_nodes
 
 
+def _switch_node_editors_to_shader(ctx) -> None:
+    for screen in ctx.workspace.screens:
+        for area in screen.areas:
+            if area.type == "NODE_EDITOR" and area.ui_type not in ("GeometryNodeTree", "CompositorNodeTree"):
+                area.ui_type = "ShaderNodeTree"
 
-current_workspace = bpy.context.workspace
-for screen in current_workspace.screens:
-    for area in screen.areas:
-        if area.type == 'NODE_EDITOR'and not area.ui_type in ["GeometryNodeTree", "CompositorNodeTree"]:
-            area.ui_type = 'ShaderNodeTree'
 
-def create_basic_material(mat, preferences):
-    
-    
-    
+def create_basic_material(mat, preferences, render_engine: str) -> None:
     material_names_to_remove = [
         "OctaneClippingMaterial",
         "OctaneCompositeMaterial",
@@ -39,171 +30,160 @@ def create_basic_material(mat, preferences):
         "OctanePortalMaterial",
         "OctaneShadowCatcherMaterial",
         "OctaneSpecularMaterial",
-        
-        "OctaneToonMaterial"
+        "OctaneToonMaterial",
     ]
-    Chosen_material = preferences.octane_preferences.octane_base_material
-    if Chosen_material == "UNIVERSAL":
-         material_names_to_remove.append("OctaneStandardSurfaceMaterial")
-         material_names_to_remove.append("OctaneMetallicMaterial")
-         Material_type = "OctaneUniversalMaterial"
-         Albedo_name = "Albedo"
-         Old_Albedo = "Base color"
-         Roughness_name = "Roughness"
-         Roughness_old = "Specular Roughness"
-         Old_Specular = "Specular"
-         Metallic_input = "Metallic"
-         
+    chosen_material = preferences.octane_preferences.octane_base_material
+    if chosen_material == "UNIVERSAL":
+        material_names_to_remove.append("OctaneStandardSurfaceMaterial")
+        material_names_to_remove.append("OctaneMetallicMaterial")
+        material_type = "OctaneUniversalMaterial"
+        albedo_name = "Albedo"
+        old_albedo = "Base color"
+        roughness_name = "Roughness"
+        roughness_old = "Specular Roughness"
+        metallic_input = "Metallic"
     else:
-         material_names_to_remove.append("OctaneUniversalMaterial")
-         material_names_to_remove.append("OctaneMetallicMaterial")
-         Material_type = "OctaneStandardSurfaceMaterial"
-         Albedo_name = "Base color"
-         Old_Albedo = "Albedo"
-         Metallic_input = "Metalness"
-         
-         Roughness_name = "Specular roughness"
-         Roughness_old = "Roughness"
-         Old_Specular = "Specular weight"
-         
-     
-    nodes = mat.node_tree.nodes
-    links = mat.node_tree.links
-    
+        material_names_to_remove.append("OctaneUniversalMaterial")
+        material_names_to_remove.append("OctaneMetallicMaterial")
+        material_type = "OctaneStandardSurfaceMaterial"
+        albedo_name = "Base color"
+        old_albedo = "Albedo"
+        metallic_input = "Metalness"
+        roughness_name = "Specular roughness"
+        roughness_old = "Roughness"
+
+    nodetree = mat.node_tree
+    nodes = nodetree.nodes
+    links = nodetree.links
+
     diffuse_texture = [node for node in nodes if node.bl_idname.startswith("OctaneRGBImage") and node.label == "Diffuse"]
-    
     ao_texture = [node for node in nodes if node.bl_idname.startswith("OctaneRGBImage") and node.label == "AO"]
-    material_node = [node for node in nodes if node.bl_idname.startswith(Material_type) and node.label == "Material"]
-    Material_output = [node for node in nodes if node.bl_idname.startswith("ShaderNodeOutputMaterial") and node.label == "Octane Output"]
-    ao_node = [node for node in nodes if node.bl_idname.startswith("OctaneCyclesMixColorNodeWrapper") and node.label == "Diffuse AO"]
-    Displacement_texture = [node for node in nodes if node.bl_idname.startswith("OctaneRGBImage") and node.label == "Displacement"]
-    Displacement_node = [node for node in nodes if ("OctaneTextureDisplacement" in node.bl_idname or "OctaneVertexDisplacement" in node.bl_idname) and ("Displacement" in node.label or "COLOR * AO" in node.label)]
+    material_node = [node for node in nodes if node.bl_idname.startswith(material_type) and node.label == "Material"]
+    material_output = [
+        node for node in nodes if node.bl_idname.startswith("ShaderNodeOutputMaterial") and node.label == "Octane Output"
+    ]
+    ao_node = [
+        node for node in nodes if node.bl_idname.startswith("OctaneCyclesMixColorNodeWrapper") and node.label == "Diffuse AO"
+    ]
+    displacement_texture = [
+        node for node in nodes if node.bl_idname.startswith("OctaneRGBImage") and node.label == "Displacement"
+    ]
+    displacement_node = [
+        node
+        for node in nodes
+        if ("OctaneTextureDisplacement" in node.bl_idname or "OctaneVertexDisplacement" in node.bl_idname)
+        and ("Displacement" in node.label or "COLOR * AO" in node.label)
+    ]
 
-    
-    
-    Diffuse_color =[]
-    Roughness_value = []
-    
-    for n in nodes:
+    diffuse_color = []
+    roughness_value = []
+
+    for n in list(nodes):
         if n.bl_idname in material_names_to_remove:
-            if Old_Albedo in n.inputs:
-                # Get the diffuse color value
-                diffuse_input = n.inputs[Old_Albedo]
-                Diffuse_color.append(diffuse_input.default_value[0])
-                Diffuse_color.append(diffuse_input.default_value[1])
-                Diffuse_color.append(diffuse_input.default_value[2])
-            elif Roughness_old in n.inputs:
-                roughness_input = n.inputs[Roughness_old]
-                Roughness_value.append(roughness_input.default_value)  
-                
+            if old_albedo in n.inputs:
+                diffuse_input = n.inputs[old_albedo]
+                diffuse_color.append(diffuse_input.default_value[0])
+                diffuse_color.append(diffuse_input.default_value[1])
+                diffuse_color.append(diffuse_input.default_value[2])
+            elif roughness_old in n.inputs:
+                roughness_input = n.inputs[roughness_old]
+                roughness_value.append(roughness_input.default_value)
             nodes.remove(n)
-            
-    Delete_nodes = [node for node in nodes if node.bl_idname.startswith("Octane") and any(z in node.label for z in ("help", "Viewport"))]
-    
-    for nd in Delete_nodes:
-        
+
+    delete_nodes = [
+        node for node in nodes if node.bl_idname.startswith("Octane") and any(z in node.label for z in ("help", "Viewport"))
+    ]
+    for nd in delete_nodes:
         nodes.remove(nd)
-        
-    
 
-    
-    texture_node = None 
-    for n in nodes:
-        if n.bl_idname == ("OctaneRGBImage"):
-            texture_node = n
-            break
-        
-    #Material output:
-    if Material_output:
-        Material_output = Material_output[0]
+    texture_node = next((n for n in nodes if n.bl_idname == "OctaneRGBImage"), None)
+
+    if material_output:
+        material_output_node = material_output[0]
     else:
-        Material_output = nodetree.nodes.new("ShaderNodeOutputMaterial")
-        Material_output.label = "Octane Output"
+        material_output_node = nodetree.nodes.new("ShaderNodeOutputMaterial")
+        material_output_node.label = "Octane Output"
 
-        
-    #Material Creation
-    
     if material_node:
-        Material = material_node[0]
-        Material.label = "Material"
+        material = material_node[0]
+        material.label = "Material"
     else:
-        Material = nodetree.nodes.new(Material_type)
-        Material.label = "Material"
-    Material.inputs[Metallic_input].default_value = 0
-    if Chosen_material != "UNIVERSAL":
-        Material.inputs["Transmission weight"].default_value = 0
-        Material.inputs["Subsurface weight"].default_value = 0
-        Material.inputs["Coating weight"].default_value = 0
-        Material.inputs["Sheen weight"].default_value = 0
-        Material.inputs["Emission weight"].default_value = 0
-        Material.inputs["Film thickness (nm)"].default_value = 0
+        material = nodetree.nodes.new(material_type)
+        material.label = "Material"
+
+    material.inputs[metallic_input].default_value = 0
+    if chosen_material != "UNIVERSAL":
+        material.inputs["Transmission weight"].default_value = 0
+        material.inputs["Subsurface weight"].default_value = 0
+        material.inputs["Coating weight"].default_value = 0
+        material.inputs["Sheen weight"].default_value = 0
+        material.inputs["Emission weight"].default_value = 0
+        material.inputs["Film thickness (nm)"].default_value = 0
     else:
-        Material.inputs["Coating"].default_value = (0,0,0)
-        Material.inputs["Sheen"].default_value = (0,0,0)
-        
-        
-    
-    
-    
-        
-    
-    if texture_node:    
-        Material.location = (texture_node.location[0] + 600, texture_node.location[1])
-    if Diffuse_color:
-        Material.inputs[Albedo_name].default_value = Diffuse_color[:3] 
-    if Roughness_value:
-        
-        Material.inputs[Roughness_name].default_value = Roughness_value
-    
-    Material.inputs["Diffuse BRDF model"].default_value = preferences.octane_preferences.octane_BRDF
-    if Chosen_material == "UNIVERSAL":
-        Material.inputs["[OctaneGroupTitle]Transmission Layer"].default_value = preferences.octane_preferences.octane_transmission
-    
-        Material.inputs["BSDF model"].default_value = preferences.octane_preferences.octane_BSDF
-        Material.inputs["Metallic reflection mode"].default_value = preferences.octane_preferences.octane_metallic_type
-        
+        material.inputs["Coating"].default_value = (0, 0, 0)
+        material.inputs["Sheen"].default_value = (0, 0, 0)
+
+    if texture_node:
+        material.location = (texture_node.location[0] + 600, texture_node.location[1])
+    if diffuse_color:
+        material.inputs[albedo_name].default_value = diffuse_color[:3]
+    if roughness_value:
+        material.inputs[roughness_name].default_value = roughness_value[0]
+
+    material.inputs["Diffuse BRDF model"].default_value = preferences.octane_preferences.octane_BRDF
+    if chosen_material == "UNIVERSAL":
+        material.inputs["[OctaneGroupTitle]Transmission Layer"].default_value = (
+            preferences.octane_preferences.octane_transmission
+        )
+        material.inputs["BSDF model"].default_value = preferences.octane_preferences.octane_BSDF
+        material.inputs["Metallic reflection mode"].default_value = preferences.octane_preferences.octane_metallic_type
     else:
-        Material.inputs["Dispersion mode"].default_value = preferences.octane_preferences.octane_Dispersion_mode
-        
+        material.inputs["Dispersion mode"].default_value = preferences.octane_preferences.octane_Dispersion_mode
+
     if ao_texture:
-        ao_texture = ao_texture[0]
-        if ao_node:
-            ao_node = ao_node[0]
-        else:
-            ao_node = setup_ao_nodes(Render_Engine, nodes, links, diffuse_texture, ao_texture, diffuse_color=None)
-        links.new(ao_node.outputs[0], Material.inputs[Albedo_name])
-    if Displacement_texture:
-        Displacement_texture = Displacement_texture[0]
-        if Displacement_node:
-            Displacement_node = Displacement_node[0]
-        else:
-            Displacement_node = setup_disp_nodes(preferences, Render_Engine, nodes, links, Displacement_texture, Displacement_node)
-        links.new(Displacement_node.outputs["Displacement out"], Material.inputs["Displacement"])
-        
-    mat.node_tree.links.new(Material.outputs[0],Material_output.inputs[0])
-    Material_output.location = (Material.location[0] + 300, Material.location[1] )
+        ao_tex = ao_texture[0]
+        ao_mix = (
+            ao_node[0]
+            if ao_node
+            else setup_ao_nodes(render_engine, nodes, links, diffuse_texture, ao_tex, diffuse_color=None)
+        )
+        links.new(ao_mix.outputs[0], material.inputs[albedo_name])
 
-       
-    
-mat = bpy.context.object.active_material
+    if displacement_texture:
+        disp_tex = displacement_texture[0]
+        disp_node = (
+            displacement_node[0]
+            if displacement_node
+            else setup_disp_nodes(preferences, render_engine, nodes, links, disp_tex, displacement_node)
+        )
+        links.new(disp_node.outputs["Displacement out"], material.inputs["Displacement"])
 
-nodetree = mat.node_tree
-        
-if not nodetree.nodes:
-    m = nodetree.nodes.new("ShaderNodeOutputMaterial")
-    m.label = "Octane Output"
-
-   
-create_basic_material(mat, preferences)
-
-Connect_To_Material(mat)
+    links.new(material.outputs[0], material_output_node.inputs[0])
+    material_output_node.location = (material.location[0] + 300, material.location[1])
 
 
+def create_basic(context=None) -> None:
+    """Entry point for ``material.create_basic`` operator."""
+    ctx = context if context is not None else bpy.context
+    preferences = get_addon_preferences(context=ctx)
+    if preferences is None:
+        raise RuntimeError("Material Converter preferences not found.")
 
+    _switch_node_editors_to_shader(ctx)
 
+    obj = getattr(ctx, "object", None) or getattr(ctx, "active_object", None)
+    mat = obj.active_material if obj else None
+    if not mat:
+        raise RuntimeError("No active material found.")
+    if not mat.use_nodes:
+        mat.use_nodes = True
+    nodetree = mat.node_tree
+    if not nodetree:
+        raise RuntimeError("Active material has no node tree.")
 
+    if not nodetree.nodes:
+        m = nodetree.nodes.new("ShaderNodeOutputMaterial")
+        m.label = "Octane Output"
 
-
-
-
-
+    create_basic_material(mat, preferences, ctx.scene.render.engine)
+    Connect_To_Material(mat)

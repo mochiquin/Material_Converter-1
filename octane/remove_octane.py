@@ -1,20 +1,21 @@
+"""Remove non-Octane shader nodes from scene materials."""
+
+from __future__ import annotations
+
 import bpy
 
-for mat in bpy.data.materials:
-    if "Dots Stroke" not in mat.name and mat.node_tree:
-        for node in mat.node_tree.nodes:
-            if node.bl_idname == 'ShaderNodeOutputMaterial':
-                if not node.inputs: 
-                    mat.node_tree.nodes.remove(node)
-                elif node.target != "ALL":
-                   mat.node_tree.nodes.remove(node) 
-                else:
-                    all_inputs_disconnected = True
-                    for input in node.inputs:
-                        if input.is_linked:
-                            all_inputs_disconnected = False
-                            break
-                    if all_inputs_disconnected:
-                        mat.node_tree.nodes.remove(node)
+
+def remove_nodes(context=None) -> None:
+    """Entry point for ``material.remove_nodes_confirm`` operator."""
+    for mat in bpy.data.materials:
+        if "Dot Stroke" in mat.name or "Dots Stroke" in mat.name or not mat.node_tree:
+            continue
+        nodes = mat.node_tree.nodes
+        for node in list(nodes):
+            if node.bl_idname == "ShaderNodeOutputMaterial":
+                if not node.inputs or node.target != "ALL":
+                    nodes.remove(node)
+                elif not any(inp.is_linked for inp in node.inputs):
+                    nodes.remove(node)
             elif not node.bl_idname.startswith("Octane"):
-                mat.node_tree.nodes.remove(node)
+                nodes.remove(node)

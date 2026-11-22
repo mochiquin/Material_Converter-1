@@ -1,1 +1,1 @@
-import bpy
+"""Converter helpers package."""

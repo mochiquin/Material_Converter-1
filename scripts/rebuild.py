@@ -1,236 +1,77 @@
-# scripts/__init__.py
-import bpy
+"""Label-matched connection rebuilding across target render engines."""
 
-def rebuild_octane_connections(mat):
-    
+from __future__ import annotations
+
+from ..core.node_mappings import (
+    OCTANE_NODE_MAPPING,
+    resolve_octane_socket_names,
+)
+
+
+def rebuild_octane_connections(mat) -> None:
+    """Rebuild node connections in an Octane material from Cycles node labels."""
     active_mat = mat
-
-    # Get Cycles nodes
     cycles_nodes = active_mat.node_tree.nodes
-    cycles_links = active_mat.node_tree.links
-
-    # Get LuxCore nodes
     octane_node_tree = active_mat.node_tree
     octane_nodes = octane_node_tree.nodes
     octane_links = octane_node_tree.links
 
-    # Dictionary mapping Cycles node types to LuxCore node types
-    node_mapping = {
-    "ShaderNodeMix": ["OctaneMixTexture","OctaneCyclesMixColorNodeWrapper","OctaneCyclesMixFloatNodeWrapper","OctaneCyclesMixFloat3NodeWrapper"],
-    "ShaderNodeTexImage": ["OctaneRGBImage"],
-    "ShaderNodeNormalMap": ["LuxCoreNodeTexNormalmap"],
-    "ShaderNodeOutputMaterial": ["LuxCoreNodeMatOutput"],
-    "ShaderNodeMapping": ["Octane3DTransformation"],
-    "ShaderNodeBsdfPrincipled": ["OctaneUniversalMaterial","OctaneStandardSurfaceMaterial","LuxCoreNodeMatGlass"],
-    "ShaderNodeBsdfTranslucent" : ["OctaneUniversalMaterial"],
-    "ShaderNodeMixShader": ["OctaneMixMaterial"],
-    "ShaderNodeBsdfGlass": ["OctaneUniversalMaterial"],
-    "ShaderNodeHueSaturation": ["OctaneColorCorrection"],
-    "ShaderNodeValToRGB":["OctaneGradientMap"],
-    "ShaderNodeBump": ["LuxCoreNodeTexBump"],
-    "ShaderNodeInvert": ["OctaneInvertTexture"],
-    "ShaderNodeRGBCurve": ["NodeReroute"],
-    # OctaneCyclesNodeMathNodeWrapper / OctaneCyclesNodeVectorMathNodeWrapper exist in
-    # the API and have matching sockets, but confirmed by real-render testing to NOT
-    # actually evaluate in Octane - they're not usable. Only Add/Subtract/Multiply have
-    # a confirmed-working, texture-domain native equivalent; everything else (Divide,
-    # Less Than, Power, ...) has no known working node yet and is intentionally left
-    # unconverted (see the Math Node block in convert_*_octane.py).
-    "ShaderNodeMath": ["OctaneAddTexture", "OctaneSubtractTexture", "OctaneMultiplyTexture"],
-    "ShaderNodeRGB": ["OctaneRGBColor"],
-    "ShaderNodeValue": ["OctaneFloatValue"],
-    }
-    # Note: ShaderNodeSeparateColor / ShaderNodeSeparateRGB are intentionally NOT
-    # in this table. A single Cycles Separate node can drive up to 3 downstream
-    # connections (R/G/B), but OctaneChannelPicker only has one output, so it
-    # needs a dedicated 1-cycles-node -> N-octane-nodes wiring pass. See
-    # rebuild_octane_separate_color_connections() below.
-
-    # Output socket name mapping
-    output_mapping = {
-    'Normal': 'Bump',
-    'Vector': 'Transform out',
-    'Alpha': 'Out Alpha',
-    'BSDF': 'Material out',
-    'Result': 'Texture out',
-    'A': 'First texture',
-    'B': 'Second texture',
-    'Color': 'Texture out'
-    }
-
-    # Input socket name mapping
-    input_mapping = {
-    'Normal': "Normal",
-    'Coat Tint': 'Coat Color',
-    'Sheen Tint': 'Sheen Color',
-    'Base Color': 'Albedo',    
-    'Coat Normal': 'Coat Bump Map',
-    'Vector': 'UV transform',
-    'Alpha': 'Opacity',
-    'Fresnel IOR': 'Dielectric IOR',
-    'Metallic': 'Metallic',
-    'Specular IOR Level': 'Specular',
-    'Surface': 'Material',
-    'Roughness': 'Roughness',
-    
-    'Result': 'Texture out',
-    'A': 'First texture',
-    'B': 'Second texture',
-    'Color': 'Texture'
-    }
-
-    # Iterate through Cycles nodes
-    for key, value_list in node_mapping.items():
-        # Find Cycles nodes of specific type
+    for key, value_list in OCTANE_NODE_MAPPING.items():
         cycles_type_nodes = [n for n in cycles_nodes if n.bl_idname == key]
 
         for cycles_node in cycles_type_nodes:
-            # Find corresponding LuxCore node types
             for value in value_list:
-                # Find LuxCore nodes of corresponding type
                 octane_type_nodes = [n for n in octane_nodes if n.bl_idname == value]
-                
-                # Find LuxCore node with matching label
                 octane_node = next((n for n in octane_type_nodes if n.label == cycles_node.label), None)
-                
-                if octane_node:
-                    # Check output connections in Cycles node
-                    for output in cycles_node.outputs:
-                        for link in output.links:
-                            target_node = link.to_node
-                            
-                            # Check if target node is in node mapping
-                            if target_node.bl_idname in node_mapping:
-                                # Find corresponding LuxCore target node
-                                octane_target_nodes = [n for n in octane_nodes if n.bl_idname in node_mapping[target_node.bl_idname]]
-                                octane_target_node = next((n for n in octane_target_nodes if n.label == target_node.label), None)
-                                
-                                if octane_target_node:
-                                    # Determine output and input socket names
-                                    if cycles_node.bl_idname == "ShaderNodeMath":
-                                        # OctaneAddTexture/SubtractTexture/MultiplyTexture all output
-                                        # "Texture out", regardless of Blender's socket name ("Value").
-                                        output_name = "Texture out"
-                                    elif cycles_node.bl_idname == "ShaderNodeValue":
-                                        # OctaneFloatValue's only output is "Float out", not "Texture out".
-                                        output_name = "Float out"
-                                    else:
-                                        output_name = output_mapping.get(output.name, output.name)
-                                    input_socket = link.to_socket
 
-                                    # Custom input name mapping logic
-                                    if target_node.bl_idname == "ShaderNodeMath":
-                                        # Blender's Math node exposes 2-3 inputs that are all
-                                        # literally named "Value" - only .identifier tells them apart.
-                                        # OctaneAdd/Subtract/MultiplyTexture only take 2 (no 3rd
-                                        # operand), which is fine since only Add/Subtract/Multiply
-                                        # are converted at all.
-                                        math_identifier_map = {'Value': 'Texture 1', 'Value_001': 'Texture 2'}
-                                        input_name = math_identifier_map.get(input_socket.identifier, input_socket.name)
-                                    elif target_node.bl_idname == "ShaderNodeMixShader":
-                                        input_name = "First material" if input_socket.identifier == "Shader" else "Second material" if input_socket.identifier == "Shader_001" else input_socket.name
-                                        if input_socket.name == "Fac":
-                                            input_name = "Amount"
-                                            
-                                    elif target_node.bl_idname == "ShaderNodeMix":
-                                        if octane_target_node.bl_idname == "OctaneCyclesMixColorNodeWrapper":
-                                            input_name = "A" if input_socket.name == "A" else "B" if input_socket.name == "B" else "Factor" if input_socket.name == "Factor" else input_socket.name
-                                        
-                                    elif target_node.bl_idname == "ShaderNodeBsdfPrincipled":
-                                        # Special case for Disney material
-                                        if octane_target_node.bl_idname == "LuxCoreNodeMatDisney" and input_socket.name == "Base Color":
-                                            input_name = "Base Color"
-                                        if octane_target_node.bl_idname == "OctaneStandardSurfaceMaterial":
-                                            if input_socket.name == "Base Color":
-                                                input_name = "Base color"
-                                            if input_socket.name == "Metallic":
-                                                input_name = "Metalness"
-                                            if input_socket.name == "Roughness":
-                                                input_name = "Specular roughness"
-                                            if input_socket.name == "Specular IOR Level":
-                                                input_name = "Specular weight"
-                                            if input_socket.name == "Normal":
-                                                input_name = "Normal"  
-                                        else:
-                                            # Default to the LuxCore equivalent
-                                            input_name = input_mapping.get(input_socket.name, input_socket.name)
-                                    elif target_node.bl_idname == "ShaderNodeRGBCurve":
-                                        input_name = "Texture"
-                                       
-                                        
-                                    elif target_node.bl_idname =="ShaderNodeBsdfTranslucent":
-                                        if octane_target_node.bl_idname =="OctaneUniversalMaterial" and input_socket.name == "Color":
-                                            input_name = "Transmission"
-                                        else:
-                                            input_name = input_mapping.get(input_socket.name, input_socket.name)
-                                    elif target_node.bl_idname =="ShaderNodeHueSaturation":
-                                        if octane_target_node.bl_idname =="OctaneColorCorrection" and input_socket.name == "Color":
-                                            input_name = "Input"
-                                        else:
-                                            input_name = input_mapping.get(input_socket.name, input_socket.name)
-                                            
-                                    elif target_node.bl_idname == "ShaderNodeValToRGB":
-                                        if input_socket.name == "Fac":
-                                            input_name = "Input texture"
-                                        else:
-                                            input_name = input_mapping.get(input_socket.name, input_socket.name)
-                                            
-                                    elif target_node.bl_idname == "ShaderNodeBsdfGlass":
-                                        print(input_socket.name)
-                                        if octane_target_node.bl_idname == "LuxCoreNodeMatGlass" and input_socket.name == "Color":
-                                            input_name = "Transmission Color"
-                                        else:
-                                            input_name = input_mapping.get(input_socket.name, input_socket.name)
-                                    elif target_node.bl_idname =="ShaderNodeBump":
-                                        if octane_target_node.bl_idname == "LuxCoreNodeTexBump" and input_socket.name == "Height":
-                                            input_name = "Value"
-                                    
+                if not octane_node:
+                    continue
 
-                                            
-                                    elif target_node.bl_idname == "ShaderNodeTexImage":
-                                        input_name = "UV transform" if input_socket.name == "Vector" else input_socket.name
-                                    elif target_node.bl_idname == "ShaderNodeNormalMap":
-                                        input_name = "Texmap" if input_socket.name == "Color" else input_socket.name
-                                    #elif input_socket.name == "Base Color":
-                                    #    input_name = "Bump Map" if target_node.bl_idname == "ShaderNodeBsdfPrincipled" else input_socket.name
-                                    #elif input_socket.name == "Coat Normal":
-                                    #    input_name = "Coat Bump Map" if target_node.bl_idname == "ShaderNodeBsdfPrincipled" else input_socket.name
-                                    elif input_socket.name == 'Fac':
-                                        input_name = "Input texture" if target_node.bl_idname == 'ShaderNodeValToRGB' else input_mapping.get(input_socket.name, input_socket.name)
-                                    else:
-                                        input_name = input_mapping.get(input_socket.name, input_socket.name)
-                                    
-                                    # Find matching output and input sockets
-                                    output_socket = next((s for s in octane_node.outputs if s.name == output_name), None)
-                                    input_socket = next((s for s in octane_target_node.inputs if s.name == input_name), None)
-                                    
-                                    # Create link in LuxCore node tree
-                                    if output_socket and input_socket:
-                                        octane_links.new(input_socket, output_socket)
+                for output in cycles_node.outputs:
+                    for link in output.links:
+                        target_node = link.to_node
+                        if target_node.bl_idname not in OCTANE_NODE_MAPPING:
+                            continue
+
+                        octane_target_nodes = [
+                            n
+                            for n in octane_nodes
+                            if n.bl_idname in OCTANE_NODE_MAPPING[target_node.bl_idname]
+                        ]
+                        octane_target_node = next(
+                            (n for n in octane_target_nodes if n.label == target_node.label),
+                            None,
+                        )
+                        if not octane_target_node:
+                            continue
+
+                        to_socket = link.to_socket
+                        output_name, input_name = resolve_octane_socket_names(
+                            from_node_type=cycles_node.bl_idname,
+                            from_socket_name=output.name,
+                            to_node_type=target_node.bl_idname,
+                            to_socket_name=to_socket.name,
+                            to_socket_identifier=getattr(to_socket, "identifier", to_socket.name),
+                            octane_target_type=octane_target_node.bl_idname,
+                        )
+
+                        output_socket = next((s for s in octane_node.outputs if s.name == output_name), None)
+                        input_socket = next((s for s in octane_target_node.inputs if s.name == input_name), None)
+                        if output_socket and input_socket:
+                            octane_links.new(input_socket, output_socket)
 
 
-
-
-def rebuild_octane_separate_color_connections(mat):
-    """
-    Wire up the OctaneChannelPicker node(s) created for each Cycles
-    ShaderNodeSeparateColor / ShaderNodeSeparateRGB node.
-
-    This can't go through rebuild_octane_connections()'s generic 1-cycles-node
-    -> 1-octane-node loop because a single Separate node can drive up to 3
-    independent downstream connections (R/G/B), while OctaneChannelPicker only
-    has one output. The octane/convert_*_octane.py scripts create one
-    OctaneChannelPicker per USED output, named "<cycles_node.name>__ch<index>"
-    (index 0/1/2 = R/G/B), before this function runs.
-    """
+def rebuild_octane_separate_color_connections(mat) -> None:
+    """Wire up OctaneChannelPicker nodes created for Separate Color/RGB nodes."""
     node_tree = mat.node_tree
     nodes = node_tree.nodes
     links = node_tree.links
 
-    separate_nodes = [n for n in nodes if n.bl_idname in ("ShaderNodeSeparateColor", "ShaderNodeSeparateRGB")]
+    separate_nodes = [
+        n for n in nodes if n.bl_idname in ("ShaderNodeSeparateColor", "ShaderNodeSeparateRGB")
+    ]
 
     for sep_node in separate_nodes:
-        # Find the Octane equivalent feeding the Separate node's single "Color"/"Image" input
         octane_source_node = None
         octane_source_output_name = None
         if sep_node.inputs[0].is_linked:
@@ -240,7 +81,11 @@ def rebuild_octane_separate_color_connections(mat):
                     octane_source_node = n
                     break
             if octane_source_node:
-                octane_source_output_name = "Texture out" if "Texture out" in octane_source_node.outputs else octane_source_node.outputs[0].name
+                octane_source_output_name = (
+                    "Texture out"
+                    if "Texture out" in octane_source_node.outputs
+                    else octane_source_node.outputs[0].name
+                )
 
         for i in range(min(3, len(sep_node.outputs))):
             out_socket = sep_node.outputs[i]
@@ -266,316 +111,251 @@ def rebuild_octane_separate_color_connections(mat):
                 if not octane_target_node:
                     continue
 
-                if target_node.bl_idname == "ShaderNodeMath":
-                    math_identifier_map = {'Value': 'Texture 1', 'Value_001': 'Texture 2'}
-                    input_name = math_identifier_map.get(input_socket.identifier, input_socket.name)
-                elif target_node.bl_idname == "ShaderNodeBsdfPrincipled" and octane_target_node.bl_idname == "OctaneStandardSurfaceMaterial":
-                    principled_to_standard = {
-                        'Base Color': 'Base color', 'Metallic': 'Metalness', 'Roughness': 'Specular roughness',
-                        'Specular IOR Level': 'Specular weight', 'Normal': 'Normal',
-                    }
-                    input_name = principled_to_standard.get(input_socket.name, input_socket.name)
-                else:
-                    input_name = input_socket.name
+                _, input_name = resolve_octane_socket_names(
+                    from_node_type=sep_node.bl_idname,
+                    from_socket_name=out_socket.name,
+                    to_node_type=target_node.bl_idname,
+                    to_socket_name=input_socket.name,
+                    to_socket_identifier=getattr(input_socket, "identifier", input_socket.name),
+                    octane_target_type=octane_target_node.bl_idname,
+                )
 
                 target_input = octane_target_node.inputs.get(input_name)
                 if target_input:
                     links.new(picker.outputs["Texture out"], target_input)
 
 
-def rebuild_vray_connections(mat):
-    active_mat = mat
+def rebuild_vray_connections(mat) -> None:
+    """Rebuild node connections for V-Ray materials."""
+    nodes = mat.node_tree.nodes
+    links = mat.node_tree.links
 
-    
-    nodes = active_mat.node_tree.nodes
-    cycles_links = active_mat.node_tree.links
-
-    
-    # Dictionary mapping Cycles node types to Vray node types
     node_mapping = {
-    "ShaderNodeMix": ["VRayNodeTexMix"],
-    "ShaderNodeRGBCurve": ["VRayNodeTexRemap"], 
-    "ShaderNodeTexImage": ["VRayNodeMetaImageTexture"],
-    "ShaderNodeNormalMap": ["VRayNodeTexNormalMapFlip"],
-    "ShaderNodeOutputMaterial": ["LuxCoreNodeMatOutput"],
-    "ShaderNodeMapping": ["VRayNodeUVWMapping"],
-    "ShaderNodeBsdfPrincipled": ["VRayNodeBRDFVRayMtl","VRayNodeBRDFSSS2Complex","LuxCoreNodeMatGlass"],
-    "ShaderNodeBsdfTranslucent" : ["VRayNodeBRDFVRayMtl"],
-    "ShaderNodeMixShader": ["LuxCoreNodeMatMix"],
-    "ShaderNodeBsdfGlass": ["LuxCoreNodeMatGlass"],
-    "ShaderNodeHueSaturation": ["VRayNodeColorCorrection"],
-    "ShaderNodeValToRGB": ["VRayNodeTexGradRamp"],
-    "ShaderNodeBump": ["LuxCoreNodeTexBump"],
-    "ShaderNodeInvert": ["VRayNodeTexInvert"]
+        "ShaderNodeMix": ["VRayNodeTexMix"],
+        "ShaderNodeRGBCurve": ["VRayNodeTexRemap"],
+        "ShaderNodeTexImage": ["VRayNodeMetaImageTexture"],
+        "ShaderNodeNormalMap": ["VRayNodeTexNormalMapFlip"],
+        "ShaderNodeOutputMaterial": ["LuxCoreNodeMatOutput"],
+        "ShaderNodeMapping": ["VRayNodeUVWMapping"],
+        "ShaderNodeBsdfPrincipled": ["VRayNodeBRDFVRayMtl", "VRayNodeBRDFSSS2Complex", "LuxCoreNodeMatGlass"],
+        "ShaderNodeBsdfTranslucent": ["VRayNodeBRDFVRayMtl"],
+        "ShaderNodeMixShader": ["LuxCoreNodeMatMix"],
+        "ShaderNodeBsdfGlass": ["LuxCoreNodeMatGlass"],
+        "ShaderNodeHueSaturation": ["VRayNodeColorCorrection"],
+        "ShaderNodeValToRGB": ["VRayNodeTexGradRamp"],
+        "ShaderNodeBump": ["LuxCoreNodeTexBump"],
+        "ShaderNodeInvert": ["VRayNodeTexInvert"],
     }
 
-    # Output socket name mapping
     output_mapping = {
-    'Normal': 'Color',
-    'Vector': 'Mapping',
-    'Alpha': 'Out Alpha',
-    'BSDF': 'Material',
-    'Result': 'Color',
-    'A': 'Color 1',
-    'B': 'Color 2',
-    'Color': 'Color'
+        "Normal": "Color",
+        "Vector": "Mapping",
+        "Alpha": "Out Alpha",
+        "BSDF": "Material",
+        "Result": "Color",
+        "A": "Color 1",
+        "B": "Color 2",
+        "Color": "Color",
     }
 
-    # Input socket name mapping
     input_mapping = {
-    'Normal': "Bump",
-
-    'Coat Tint': 'Coat Color',
-    'Sheen Tint': 'Sheen Color',
-    'Base Color': 'Diffuse Color',
-    'Coat Normal': 'Coat Bump Map',
-    'Vector': 'Mapping',
-    'Alpha': 'Opacity',
-    'Fresnel IOR': 'IOR',
-    'Metallic': 'Metalness',
-    'Surface': 'Material',
-    'Normal' : 'Bump Map',
-    'Roughness': 'Reflection Glossiness',
-    'Result': 'Texture out',
-    'A': 'Color1',
-    'B': 'Color2',
-    'Color': 'Color'
+        "Normal": "Bump Map",
+        "Coat Tint": "Coat Color",
+        "Sheen Tint": "Sheen Color",
+        "Base Color": "Diffuse Color",
+        "Coat Normal": "Coat Bump Map",
+        "Vector": "Mapping",
+        "Alpha": "Opacity",
+        "Fresnel IOR": "IOR",
+        "Metallic": "Metalness",
+        "Surface": "Material",
+        "Roughness": "Reflection Glossiness",
+        "Result": "Texture out",
+        "A": "Color1",
+        "B": "Color2",
+        "Color": "Color",
     }
-
-   
-   
-   
-    
-    links = active_mat.node_tree.links
 
     for key, value_list in node_mapping.items():
         key_nodes = [n for n in nodes if n.bl_idname == key]
-        
-
         for key_node in key_nodes:
             for output in key_node.outputs:
                 for link in output.links:
                     target_node = link.to_node
+                    if target_node.bl_idname not in node_mapping:
+                        continue
+                    for value in value_list:
+                        value_nodes = [n for n in nodes if n.bl_idname == value]
+                        vray_node = next((n for n in value_nodes if n.label == key_node.label), None)
+                        if not vray_node:
+                            continue
+                        vray_target = next(
+                            (
+                                n
+                                for n in nodes
+                                if n.bl_idname in node_mapping[target_node.bl_idname] and n.label == target_node.label
+                            ),
+                            None,
+                        )
+                        if not vray_target:
+                            continue
 
-                    # Check if the node is in the node_mapping dictionary
-                    if target_node.bl_idname in node_mapping:
-                        for value in value_list:
-                            value_nodes = [n for n in nodes if n.bl_idname == value]
+                        output_name = output_mapping.get(output.name, output.name)
+                        to_socket = link.to_socket
+                        input_name = input_mapping.get(to_socket.name, to_socket.name)
 
-                            # Find Octane node with the same label
-                            Vray_node = next((n for n in value_nodes if n.label == key_node.label), None)
-                            if Vray_node:
-                                # Find Octane node with the same label as target_node
-                                Vray_Target = next((n for n in nodes if n.bl_idname in node_mapping[target_node.bl_idname] and n.label == target_node.label), None)
-                                if Vray_Target:
-                                    # Determine input name
-                                    output_name = output_mapping.get(output.name, output.name)  # Get name from mapping, default to original name
-                                    input_socket = link.to_socket
-                                    print(target_node.bl_idname,Vray_Target.bl_idname  )
+                        if target_node.bl_idname == "ShaderNodeMix":
+                            input_name = (
+                                to_socket.name
+                                if vray_target.bl_idname == "OctaneCyclesMixColorNodeWrapper"
+                                else input_mapping.get(to_socket.name, to_socket.name)
+                            )
+                        elif target_node.bl_idname == "ShaderNodeRGBCurve" and to_socket.name == "Color":
+                            input_name = "Input Color"
+                        elif target_node.bl_idname == "ShaderNodeValToRGB" and vray_target.bl_idname == "VRayNodeTexGradRamp":
+                            input_name = "Texture Map"
+                        elif target_node.bl_idname == "ShaderNodeBsdfTranslucent" and to_socket.name == "Color":
+                            input_name = "Translucency Color"
+                        elif vray_target.bl_idname == "VRayNodeColorCorrection" and to_socket.name == "Color":
+                            input_name = "Source Color"
+                        elif vray_target.bl_idname == "VRayNodeTexRemap" and to_socket.name == "Color":
+                            input_name = "Input Color"
+                        elif vray_target.bl_idname == "VRayNodeTexInvert" and to_socket.name == "Color":
+                            input_name = "Texture"
+                        elif target_node.bl_idname == "ShaderNodeTexImage" and to_socket.name == "Vector":
+                            input_name = "Mapping"
+                        elif target_node.bl_idname == "ShaderNodeNormalMap" and to_socket.name == "Color":
+                            input_name = "Texmap"
+                        elif to_socket.name == "Normal" and target_node.bl_idname == "ShaderNodeBsdfPrincipled":
+                            input_name = "Bump Map"
+                        elif to_socket.name == "Coat Normal" and target_node.bl_idname == "ShaderNodeBsdfPrincipled":
+                            input_name = "Coat Bump Map"
 
-                                    # Custom logic to handle specific input values
-                                    if target_node.bl_idname == "ShaderNodeMix":
-                                        if Vray_Target.bl_idname == "OctaneCyclesMixColorNodeWrapper":
-                                            input_name = input_socket.name
-                                        else:
-                                            input_name = input_mapping.get(input_socket.name, input_socket.name)
-                                    elif target_node.bl_idname == "ShaderNodeRGBCurve":
-                                        if input_socket.name == "Color":
-                                            input_name = "Input Color"        
-                                    elif target_node.bl_idname == 'ShaderNodeValToRGB':
-                                        if Vray_Target.bl_idname  == "VRayNodeTexGradRamp":
-                                            input_name = "Texture Map" 
-                                        else: 
-                                            input_name = input_mapping.get(input_socket.name, input_socket.name)
-                                            
-                                    elif target_node.bl_idname == "ShaderNodeBsdfTranslucent":
-                                        if input_socket.name == "Color":
-                                            input_name = "Translucency Color"
-                                    elif Vray_Target.bl_idname == "VRayNodeColorCorrection":
-                                        if input_socket.name == "Color":
-                                            input_name = "Source Color"
-                                    elif Vray_Target.bl_idname == "VRayNodeTexRemap":
-                                        
-                                        if input_socket.name == "Color":
-                                            input_name = "Input Color"
-                                    elif Vray_Target.bl_idname == "VRayNodeTexInvert":
-                                        if input_socket.name == "Color":
-                                            input_name = "Texture"
-                                        
-                                            
-                                    elif target_node.bl_idname == "ShaderNodeTexImage":
-                                        if input_socket.name == "Vector":
-                                            input_name = "Mapping"
-                                    elif target_node.bl_idname == "ShaderNodeNormalMap":
-                                        
-                                        if input_socket.name == "Color":
-                                            input_name = "Texmap"
-                                    elif input_socket.name == "Normal":
-                                        
-                                      
-                                        if target_node.bl_idname == "ShaderNodeBsdfPrincipled":
-                                            input_name = "Bump Map"
-                                    elif input_socket.name == "Coat Normal":
-                                        if target_node.bl_idname == "ShaderNodeBsdfPrincipled":
-                                            input_name = "Coat Bump Map"
-                                                                       
-                                    
-                                    else:
-                                        input_name = input_mapping.get(input_socket.name, input_socket.name)
+                        out_sock = next((s for s in vray_node.outputs if s.name == output_name), None)
+                        in_sock = next((s for s in vray_target.inputs if s.name == input_name), None)
+                        if out_sock and in_sock:
+                            links.new(in_sock, out_sock)
 
-                                     # Connect nodes
-                                    output_socket = next((s for s in Vray_node.outputs if s.name == output_name), None)
-                                    input_socket = next((s for s in Vray_Target.inputs if s.name == input_name), None)
-                                    if output_socket and input_socket:
-                                        links.new(input_socket, output_socket)
-                                        
-def rebuild_Luxcore_connections(mat):
-        
-    active_mat = mat
 
-    # Get Cycles nodes
-    cycles_nodes = active_mat.node_tree.nodes
-    cycles_links = active_mat.node_tree.links
-
-    # Get LuxCore nodes
-    luxcore_node_tree = active_mat.luxcore.node_tree
+def rebuild_Luxcore_connections(mat) -> None:
+    """Rebuild node connections for LuxCore materials."""
+    cycles_nodes = mat.node_tree.nodes
+    luxcore_node_tree = mat.luxcore.node_tree
     luxcore_nodes = luxcore_node_tree.nodes
     luxcore_links = luxcore_node_tree.links
 
-    # Dictionary mapping Cycles node types to LuxCore node types
     node_mapping = {
-    "ShaderNodeMix": ["LuxCoreNodeTexColorMix"],
-    "ShaderNodeRGBCurve": ["NodeReroute"],    
-    "ShaderNodeTexImage": ["LuxCoreNodeTexImagemap"],
-    "ShaderNodeNormalMap": ["LuxCoreNodeTexNormalmap"],
-    "ShaderNodeOutputMaterial": ["LuxCoreNodeMatOutput"],
-    "ShaderNodeMapping": ["LuxCoreNodeTexMapping2D"],
-    "ShaderNodeBsdfPrincipled": ["LuxCoreNodeMatDisney","LuxCoreNodeMatGlossyTranslucent","LuxCoreNodeMatGlass"],
-    "ShaderNodeBsdfTranslucent" : ["LuxCoreNodeMatGlossyTranslucent"],
-    "ShaderNodeMixShader": ["LuxCoreNodeMatMix"],
-    "ShaderNodeBsdfGlass": ["LuxCoreNodeMatGlass"],
-    "ShaderNodeHueSaturation": ["LuxCoreNodeTexHSV"],
-    "ShaderNodeValToRGB":["LuxCoreNodeTexBand"],
-    "ShaderNodeBump": ["LuxCoreNodeTexBump"],
-    "ShaderNodeInvert": ["LuxCoreNodeTexInvert"]
+        "ShaderNodeMix": ["LuxCoreNodeTexColorMix"],
+        "ShaderNodeRGBCurve": ["NodeReroute"],
+        "ShaderNodeTexImage": ["LuxCoreNodeTexImagemap"],
+        "ShaderNodeNormalMap": ["LuxCoreNodeTexNormalmap"],
+        "ShaderNodeOutputMaterial": ["LuxCoreNodeMatOutput"],
+        "ShaderNodeMapping": ["LuxCoreNodeTexMapping2D"],
+        "ShaderNodeBsdfPrincipled": ["LuxCoreNodeMatDisney", "LuxCoreNodeMatGlossyTranslucent", "LuxCoreNodeMatGlass"],
+        "ShaderNodeBsdfTranslucent": ["LuxCoreNodeMatGlossyTranslucent"],
+        "ShaderNodeMixShader": ["LuxCoreNodeMatMix"],
+        "ShaderNodeBsdfGlass": ["LuxCoreNodeMatGlass"],
+        "ShaderNodeHueSaturation": ["LuxCoreNodeTexHSV"],
+        "ShaderNodeValToRGB": ["LuxCoreNodeTexBand"],
+        "ShaderNodeBump": ["LuxCoreNodeTexBump"],
+        "ShaderNodeInvert": ["LuxCoreNodeTexInvert"],
     }
 
-    # Output socket name mapping
     output_mapping = {
-    'Normal': 'Bump',
-    'Vector': '2D Mapping',
-    'Alpha': 'Out Alpha',
-    'BSDF': 'Material',
-    'Result': 'Color',
-    'A': 'First texture',
-    'B': 'Second texture',
-    'Color': 'Color'
+        "Normal": "Bump",
+        "Vector": "2D Mapping",
+        "Alpha": "Out Alpha",
+        "BSDF": "Material",
+        "Result": "Color",
+        "A": "First texture",
+        "B": "Second texture",
+        "Color": "Color",
     }
 
-    # Input socket name mapping
     input_mapping = {
-    'Normal': "Bump",
-
-    'Coat Tint': 'Coat Color',
-    'Sheen Tint': 'Sheen Color',
-    'Base Color': 'Diffuse Color',
-    'Coat Normal': 'Coat Bump Map',
-    'Vector': '2D Mapping',
-    'Alpha': 'Opacity',
-    'Fresnel IOR': 'IOR',
-    'Metallic': 'Metalness',
-    'Surface': 'Material',
-    'Roughness': 'Roughness',
-    'Result': 'Texture out',
-    'A': 'Color 1',
-    'B': 'Color 2',
-    'Color': 'Color'
+        "Normal": "Bump",
+        "Coat Tint": "Coat Color",
+        "Sheen Tint": "Sheen Color",
+        "Base Color": "Diffuse Color",
+        "Coat Normal": "Coat Bump Map",
+        "Vector": "2D Mapping",
+        "Alpha": "Opacity",
+        "Fresnel IOR": "IOR",
+        "Metallic": "Metalness",
+        "Surface": "Material",
+        "Roughness": "Roughness",
+        "Result": "Texture out",
+        "A": "Color 1",
+        "B": "Color 2",
+        "Color": "Color",
     }
 
-    # Iterate through Cycles nodes
     for key, value_list in node_mapping.items():
-        # Find Cycles nodes of specific type
         cycles_type_nodes = [n for n in cycles_nodes if n.bl_idname == key]
-
         for cycles_node in cycles_type_nodes:
-            # Find corresponding LuxCore node types
             for value in value_list:
-                # Find LuxCore nodes of corresponding type
                 luxcore_type_nodes = [n for n in luxcore_nodes if n.bl_idname == value]
-                
-                # Find LuxCore node with matching label
                 luxcore_node = next((n for n in luxcore_type_nodes if n.label == cycles_node.label), None)
-                
-                if luxcore_node:
-                    # Check output connections in Cycles node
-                    for output in cycles_node.outputs:
-                        for link in output.links:
-                            target_node = link.to_node
-                            
-                            # Check if target node is in node mapping
-                            if target_node.bl_idname in node_mapping:
-                                # Find corresponding LuxCore target node
-                                luxcore_target_nodes = [n for n in luxcore_nodes if n.bl_idname in node_mapping[target_node.bl_idname]]
-                                luxcore_target_node = next((n for n in luxcore_target_nodes if n.label == target_node.label), None)
-                                
-                                if luxcore_target_node:
-                                    # Determine output and input socket names
-                                    output_name = output_mapping.get(output.name, output.name)
-                                    input_socket = link.to_socket
-                                    
-                                    # Custom input name mapping logic
-                                    if target_node.bl_idname == "ShaderNodeMixShader":
-                                        input_name = "Material 1" if input_socket.identifier == "Shader" else "Material 2" if input_socket.identifier == "Shader_001" else input_socket.name
-                                    elif target_node.bl_idname == "ShaderNodeBsdfPrincipled":
-                                        # Special case for Disney material
-                                        if luxcore_target_node.bl_idname == "LuxCoreNodeMatDisney" and input_socket.name == "Base Color":
-                                            input_name = "Base Color"
-                                        else:
-                                            # Default to the LuxCore equivalent
-                                            input_name = input_mapping.get(input_socket.name, input_socket.name)
-                                    elif target_node.bl_idname =="ShaderNodeBsdfTranslucent":
-                                        if luxcore_target_node.bl_idname =="LuxCoreNodeMatGlossyTranslucent" and input_socket.name == "Color":
-                                            input_name = "Transmission Color"
-                                        else:
-                                            input_name = input_mapping.get(input_socket.name, input_socket.name)
-                                            
-                                    elif target_node.bl_idname == "ShaderNodeValToRGB":
-                                        if input_socket.name == "Fac":
-                                            input_name = "Amount"
-                                        else:
-                                            input_name = input_mapping.get(input_socket.name, input_socket.name)
-                                            
-                                    elif target_node.bl_idname == "ShaderNodeBsdfGlass":
-                                        print(input_socket.name)
-                                        if luxcore_target_node.bl_idname == "LuxCoreNodeMatGlass" and input_socket.name == "Color":
-                                            input_name = "Transmission Color"
-                                        else:
-                                            input_name = input_mapping.get(input_socket.name, input_socket.name)
-                                    elif target_node.bl_idname =="ShaderNodeBump":
-                                        if luxcore_target_node.bl_idname == "LuxCoreNodeTexBump" and input_socket.name == "Height":
-                                            input_name = "Value"
-                                            
-                                    elif target_node.bl_idname == "ShaderNodeTexImage":
-                                        input_name = "2D Mapping" if input_socket.name == "Vector" else input_socket.name
-                                    elif target_node.bl_idname == "ShaderNodeNormalMap":
-                                        input_name = "Texmap" if input_socket.name == "Color" else input_socket.name
-                                    elif input_socket.name == "Base Color":
-                                        input_name = "Bump Map" if target_node.bl_idname == "ShaderNodeBsdfPrincipled" else input_socket.name
-                                    elif input_socket.name == "Coat Normal":
-                                        input_name = "Coat Bump Map" if target_node.bl_idname == "ShaderNodeBsdfPrincipled" else input_socket.name
-                                    elif input_socket.name == 'Fac':
-                                        input_name = "Input texture" if target_node.bl_idname == 'ShaderNodeValToRGB' else input_mapping.get(input_socket.name, input_socket.name)
-                                    else:
-                                        input_name = input_mapping.get(input_socket.name, input_socket.name)
-                                    
-                                    # Find matching output and input sockets
-                                    output_socket = next((s for s in luxcore_node.outputs if s.name == output_name), None)
-                                    input_socket = next((s for s in luxcore_target_node.inputs if s.name == input_name), None)
-                                    
-                                    # Create link in LuxCore node tree
-                                    if output_socket and input_socket:
-                                        luxcore_links.new(input_socket, output_socket)
+                if not luxcore_node:
+                    continue
 
+                for output in cycles_node.outputs:
+                    for link in output.links:
+                        target_node = link.to_node
+                        if target_node.bl_idname not in node_mapping:
+                            continue
 
+                        luxcore_target_nodes = [
+                            n
+                            for n in luxcore_nodes
+                            if n.bl_idname in node_mapping[target_node.bl_idname]
+                        ]
+                        luxcore_target_node = next(
+                            (n for n in luxcore_target_nodes if n.label == target_node.label),
+                            None,
+                        )
+                        if not luxcore_target_node:
+                            continue
 
+                        output_name = output_mapping.get(output.name, output.name)
+                        to_socket = link.to_socket
+                        input_name = input_mapping.get(to_socket.name, to_socket.name)
 
+                        if target_node.bl_idname == "ShaderNodeMixShader":
+                            input_name = (
+                                "Material 1"
+                                if to_socket.identifier == "Shader"
+                                else "Material 2"
+                                if to_socket.identifier == "Shader_001"
+                                else to_socket.name
+                            )
+                        elif target_node.bl_idname == "ShaderNodeBsdfPrincipled":
+                            if luxcore_target_node.bl_idname == "LuxCoreNodeMatDisney" and to_socket.name == "Base Color":
+                                input_name = "Base Color"
+                        elif target_node.bl_idname == "ShaderNodeBsdfTranslucent":
+                            if luxcore_target_node.bl_idname == "LuxCoreNodeMatGlossyTranslucent" and to_socket.name == "Color":
+                                input_name = "Transmission Color"
+                        elif target_node.bl_idname == "ShaderNodeValToRGB":
+                            if to_socket.name == "Fac":
+                                input_name = "Amount"
+                        elif target_node.bl_idname == "ShaderNodeBsdfGlass":
+                            if luxcore_target_node.bl_idname == "LuxCoreNodeMatGlass" and to_socket.name == "Color":
+                                input_name = "Transmission Color"
+                        elif target_node.bl_idname == "ShaderNodeBump":
+                            if luxcore_target_node.bl_idname == "LuxCoreNodeTexBump" and to_socket.name == "Height":
+                                input_name = "Value"
+                        elif target_node.bl_idname == "ShaderNodeTexImage":
+                            input_name = "2D Mapping" if to_socket.name == "Vector" else to_socket.name
+                        elif target_node.bl_idname == "ShaderNodeNormalMap":
+                            input_name = "Texmap" if to_socket.name == "Color" else to_socket.name
+                        elif to_socket.name == "Base Color" and target_node.bl_idname == "ShaderNodeBsdfPrincipled":
+                            input_name = "Bump Map"
+                        elif to_socket.name == "Coat Normal" and target_node.bl_idname == "ShaderNodeBsdfPrincipled":
+                            input_name = "Coat Bump Map"
+                        elif to_socket.name == "Fac" and target_node.bl_idname == "ShaderNodeValToRGB":
+                            input_name = "Input texture"
+
+                        out_sock = next((s for s in luxcore_node.outputs if s.name == output_name), None)
+                        in_sock = next((s for s in luxcore_target_node.inputs if s.name == input_name), None)
+                        if out_sock and in_sock:
+                            luxcore_links.new(in_sock, out_sock)

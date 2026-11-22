@@ -1,32 +1,28 @@
-import os
+"""Operator package registration."""
+
+from __future__ import annotations
+
 import importlib
+from pathlib import Path
 
-def register_operators():
-    # Pobierz ścieżkę folderu operators
-    operators_path = os.path.dirname(__file__)
-    operators_files = [
-        f[:-3] for f in os.listdir(operators_path)
-        if f.endswith('.py') and f != '__init__.py'
+
+def register_operators() -> None:
+    operators_path = Path(__file__).resolve().parent
+    operator_files = [
+        p.stem for p in operators_path.iterdir() if p.suffix == ".py" and p.name != "__init__.py"
     ]
-
-    # Import i rejestracja operatorów
-    for module_name in operators_files:
-        module_path = f"{__package__}.{module_name}"
-        module = importlib.import_module(module_path)
+    for module_name in operator_files:
+        module = importlib.import_module(f"{__package__}.{module_name}")
         if hasattr(module, "register"):
             module.register()
 
-def unregister_operators():
-    # Pobierz ścieżkę folderu operators
-    operators_path = os.path.dirname(__file__)
-    operators_files = [
-        f[:-3] for f in os.listdir(operators_path)
-        if f.endswith('.py') and f != '__init__.py'
-    ]
 
-    # Wyrejestrowanie operatorów
-    for module_name in operators_files:
-        module_path = f"{__package__}.{module_name}"
-        module = importlib.import_module(module_path)
+def unregister_operators() -> None:
+    operators_path = Path(__file__).resolve().parent
+    operator_files = [
+        p.stem for p in operators_path.iterdir() if p.suffix == ".py" and p.name != "__init__.py"
+    ]
+    for module_name in operator_files:
+        module = importlib.import_module(f"{__package__}.{module_name}")
         if hasattr(module, "unregister"):
             module.unregister()

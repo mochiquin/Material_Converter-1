@@ -1,0 +1,45 @@
+[project]
+name = "material-converter"
+version = "1.0.8"
+description = "Blender addon that converts Cycles materials to Octane, V-Ray, and LuxCore"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-v"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["E402"]
+# Untouched legacy engine/helper modules preserved from upstream
+"cycles/**" = ["E", "F", "I", "W"]
+"luxcore/**" = ["E", "F", "I", "W"]
+"vray/**" = ["E", "F", "I", "W"]
+"preferences/**" = ["E", "F", "I", "W"]
+"converter/Convert_*.py" = ["E", "F", "I", "W"]
+"converter/Convert*.py" = ["E", "F", "I", "W"]
+"converter/Shader_node_group.py" = ["E", "F", "I", "W"]
+"converter/convert_curve.py" = ["E", "F", "I", "W"]
+"converter/__init__.py" = ["W"]
+"octane/viewport_octane.py" = ["E", "F", "I", "W"]
+"scripts/__init__.py" = ["W"]
+"scripts/luxcore_tools.py" = ["E", "F", "I", "W"]
+"scripts/nodes.py" = ["E", "F", "I", "W"]
+"scripts/premade.py" = ["E", "F", "I", "W"]
+"scripts/vray_tools.py" = ["E", "F", "I", "W"]

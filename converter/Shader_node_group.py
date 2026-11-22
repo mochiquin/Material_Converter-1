@@ -8,7 +8,7 @@ convert_folder = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "
 if convert_folder not in sys.path:
     sys.path.append(convert_folder)
 
-from convert_images import Convert_image_node
+from .convert_images import Convert_image_node
 
 # Force reload this module to ensure latest code is used
 print("=" * 60)

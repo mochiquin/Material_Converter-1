@@ -1,28 +1,34 @@
-import bpy
-import os
-import io
-import math
-import sys
-import time
 import contextlib
+import io
+import time
 
-## Import ##
-script_folder = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "scripts"))
-if script_folder not in sys.path:
-    sys.path.append(script_folder)
+import bpy
 
-convert_folder = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "converter"))
-if convert_folder not in sys.path:
-    sys.path.append(convert_folder)
-
-from rebuild import rebuild_octane_connections, rebuild_octane_separate_color_connections
-from connect_nodes import (connect_to_closest_octane_group_node, Connect_To_Material, Connect_Vray_Mapping_Node, Connect_Alpha_Clip_Texture)
-from premade import (label_nodes_from_base_color, set_labels_recursive, remove_reroutes_from_material)
-
-# Import Node Conversion
-from convert_curve import Convert_Curve_node
-from convert_images import Convert_image_node
-from Shader_node_group import Unpack_Shader_node_group, ungroup_all_recursively
+from ..converter.convert_curve import Convert_Curve_node
+from ..converter.convert_images import Convert_image_node
+from ..converter.Shader_node_group import Unpack_Shader_node_group, ungroup_all_recursively
+from ..core.node_mappings import (
+    BLEND_TYPE_MAPPING,
+    UNIVERSAL_MATERIAL_INPUT_INDICES,
+    VECTOR_MODE_MAPPING,
+)
+from ..executor.addon_helpers import get_addon_preferences
+from ..executor.octane_executor import (
+    apply_octane_mapping_nodes,
+    apply_octane_math_nodes,
+    apply_octane_separate_color,
+    log_material_audit_warnings,
+)
+from ..scripts.connect_nodes import (
+    Connect_Alpha_Clip_Texture,
+    Connect_To_Material,
+    Connect_Vray_Mapping_Node,
+)
+from ..scripts.premade import label_nodes_from_base_color, remove_reroutes_from_material
+from ..scripts.rebuild import (
+    rebuild_octane_connections,
+    rebuild_octane_separate_color_connections,
+)
 
 
 def Convert_Universal_Material(cycles_principled, c_nodes_tree, preferences):
@@ -49,10 +55,8 @@ def Convert_Universal_Material(cycles_principled, c_nodes_tree, preferences):
     new_shader_opacity = cycles_principled.inputs["Alpha"].default_value
 
     #Subsurface
-    new_shader_Base_Subsurface = cycles_principled.inputs["Subsurface Weight"].default_value
     #Specular:
     new_shader_Specualar = cycles_principled.inputs["Specular IOR Level"].default_value
-    new_shader_Specualar_Tilt = cycles_principled.inputs["Specular Tint"].default_value[0]
     #Anisotropic
     new_shader_Anisotropic = cycles_principled.inputs["Anisotropic"].default_value
     new_shader_Anisotropic_rotation = cycles_principled.inputs["Anisotropic Rotation"].default_value
@@ -65,8 +69,6 @@ def Convert_Universal_Material(cycles_principled, c_nodes_tree, preferences):
     new_shader_Clearcoat_Tilt = cycles_principled.inputs["Coat Tint"].default_value[:3]
     new_shader_clearcoat_Rougness = cycles_principled.inputs["Coat Roughness"].default_value
     new_shader_clearcoat_IOR = cycles_principled.inputs["Coat IOR"].default_value
-    #Transmission
-    new_shader_Transmission = cycles_principled.inputs["Transmission Weight"].default_value
     #Thin Film:
     new_shader_Thin_Film_Thickness = cycles_principled.inputs["Thin Film Thickness"].default_value
     new_shader_Thin_Film_IOR = cycles_principled.inputs["Thin Film IOR"].default_value
@@ -285,7 +287,9 @@ def _convert_material_to_octane(mat):
     kept ending up working in one entry point and silently missing from the other
     two. Fix bugs/add features HERE, once - do not re-duplicate this function.
     """
-    preferences = bpy.context.preferences.addons["Material_Converter 1"].preferences
+    preferences = get_addon_preferences()
+    if preferences is None:
+        raise RuntimeError("Material Converter preferences not found.")
     Chosen_material = preferences.octane_preferences.octane_base_material
     displacement_type = preferences.octane_preferences.octane_displacement_mode
 
@@ -295,18 +299,8 @@ def _convert_material_to_octane(mat):
         return
 
     remove_reroutes_from_material(mat)
-
-    # Ungroup all node groups before conversion (simplified approach)
-    # This flattens the entire node tree so all nodes are in the main material tree
-    print("=" * 60)
-    print(f"UNGROUPING ALL NODE GROUPS BEFORE CONVERSION ({mat.name})")
-    print("=" * 60)
     ungroup_all_recursively(mat)
-
-    # Label nodes AFTER ungrouping so all nodes are accessible
-    print("=" * 60)
-    print(f"LABELING NODES BASED ON CONNECTIONS ({mat.name})")
-    print("=" * 60)
+    log_material_audit_warnings(mat)
     label_nodes_from_base_color(mat)
 
     active_material = mat
@@ -329,7 +323,6 @@ def _convert_material_to_octane(mat):
     Cycles_ShaderMix_nodes = [node for node in c_nodes_tree.nodes if node.bl_idname == "ShaderNodeMixShader"]
     Cycles_HSV_nodes = [node for node in c_nodes_tree.nodes if node.bl_idname.startswith("ShaderNodeHueSaturation")]
     val_to_rgb_nodes = [node for node in c_nodes_tree.nodes if node.bl_idname.startswith("ShaderNodeValToRGB")]
-    Cycles_Bump_nodes = [node for node in c_nodes_tree.nodes if node.bl_idname.startswith("ShaderNodeBump")]
     Cycles_Mapping_Nodes = [node for node in c_nodes_tree.nodes if node.bl_idname.startswith("ShaderNodeMapping")]
     Cycles_Invert_Nodes = [node for node in c_nodes_tree.nodes if node.bl_idname.startswith("ShaderNodeInvert")]
     Cycles_Normal_Nodes = [node for node in c_nodes_tree.nodes if node.bl_idname.startswith("ShaderNodeNormalMap")]
@@ -339,7 +332,6 @@ def _convert_material_to_octane(mat):
     Cycles_RGB_Nodes = [node for node in c_nodes_tree.nodes if node.bl_idname == "ShaderNodeRGB"]
     Cycles_Value_Nodes = [node for node in c_nodes_tree.nodes if node.bl_idname == "ShaderNodeValue"]
     Displacement_texture = [node for node in nodes if node.bl_idname.startswith("OctaneRGBImage") and node.label == "Displacement"]
-    Displacement_node = [node for node in nodes if ("OctaneTextureDisplacement" in node.bl_idname or "OctaneVertexDisplacement" in node.bl_idname) and ("Displacement" in node.label or "COLOR * AO" in node.label)]
     Cycles_curves = [node for node in nodes if node.bl_idname == "ShaderNodeRGBCurve"]
 
     # Curves Conversion:
@@ -368,58 +360,45 @@ def _convert_material_to_octane(mat):
                 else:
                     print(f"    ! Skipped non-image node: {input_node.name} ({input_node.bl_idname})")
 
-        print(f"    → Processed Normal Map node")
+        print("    → Processed Normal Map node")
 
     #Octane_Output:
+    Octane_Output = None
+    Cycles_EEVEE_Output = None
 
-    for Octane_output_node in Cycles_Output_nodes:
-        # Inicjalizacja zmiennych do przechowywania znalezionych nodów
-        Octane_Output = None
-        Cycles_EEVEE_Output = None
-        Eevee_Output = None
-        Cycles_Output = None
-
-        # Pierwszy przebieg - szukanie istniejących nodów
-        for output_node in Cycles_Output_nodes:
-            if output_node.inputs[0].is_linked:
-                linked_node = output_node.inputs[0].links[0].from_node
-                if linked_node.bl_idname.startswith("Octane"):
-                    Octane_Output = output_node
-                    Octane_Output.label = "Octane Output"
-                else:
-                    Cycles_EEVEE_Output = output_node
-            elif not output_node.inputs[0].is_linked:
-
+    for output_node in Cycles_Output_nodes:
+        if output_node.inputs[0].is_linked:
+            linked_node = output_node.inputs[0].links[0].from_node
+            if linked_node.bl_idname.startswith("Octane"):
                 Octane_Output = output_node
-                Octane_Output.target = "ALL"
                 Octane_Output.label = "Octane Output"
             else:
-                pass
-
-        if Cycles_EEVEE_Output:
-            if Cycles_EEVEE_Output.target == "ALL":
-                Cycles_output = Cycles_EEVEE_Output
-                Cycles_output.target = "CYCLES"
-                EEVEE_output = c_nodes_tree.nodes.new('ShaderNodeOutputMaterial')
-                EEVEE_output.location = (Cycles_output.location [0], Cycles_output.location[1] - 300)
-                EEVEE_output.target = "EEVEE"
-                # Przeniesienie połączeń wejściowych
-                for i, input_socket in enumerate(Cycles_EEVEE_Output.inputs):
-                    if input_socket.is_linked:
-                        for link in input_socket.links:
-                            c_nodes_tree.links.new(link.from_socket, EEVEE_output.inputs[i])
-
-                # Przeniesienie połączeń wyjściowych
-                for i, output_socket in enumerate(Cycles_EEVEE_Output.outputs):
-                    if output_socket.is_linked:
-                        for link in output_socket.links:
-                            c_nodes_tree.links.new(EEVEE_output.outputs[i], link.to_socket)
-            else:
-                pass
-        if not Octane_Output:
-            Octane_Output = c_nodes_tree.nodes.new('ShaderNodeOutputMaterial')
-            Octane_Output.label = "Octane Output"
+                Cycles_EEVEE_Output = output_node
+        elif not output_node.inputs[0].is_linked:
+            Octane_Output = output_node
             Octane_Output.target = "ALL"
+            Octane_Output.label = "Octane Output"
+
+    if Cycles_EEVEE_Output and Cycles_EEVEE_Output.target == "ALL":
+        Cycles_output = Cycles_EEVEE_Output
+        Cycles_output.target = "CYCLES"
+        EEVEE_output = c_nodes_tree.nodes.new("ShaderNodeOutputMaterial")
+        EEVEE_output.location = (Cycles_output.location[0], Cycles_output.location[1] - 300)
+        EEVEE_output.target = "EEVEE"
+        for i, input_socket in enumerate(Cycles_EEVEE_Output.inputs):
+            if input_socket.is_linked:
+                for link in input_socket.links:
+                    c_nodes_tree.links.new(link.from_socket, EEVEE_output.inputs[i])
+
+        for i, output_socket in enumerate(Cycles_EEVEE_Output.outputs):
+            if output_socket.is_linked:
+                for link in output_socket.links:
+                    c_nodes_tree.links.new(EEVEE_output.outputs[i], link.to_socket)
+
+    if not Octane_Output:
+        Octane_Output = c_nodes_tree.nodes.new("ShaderNodeOutputMaterial")
+        Octane_Output.label = "Octane Output"
+        Octane_Output.target = "ALL"
 
     # Process node groups and collect Principled BSDF nodes found inside them
     principled_nodes_in_groups = []
@@ -438,7 +417,6 @@ def _convert_material_to_octane(mat):
     # Convert Principled BSDF nodes found inside node groups
     for principled_info in principled_nodes_in_groups:
         cycles_principled = principled_info['node']
-        source_node_tree = principled_info['node_tree']
 
         print(f"Converting Principled BSDF from node group: {principled_info['group_name']}")
 
@@ -557,7 +535,7 @@ def _convert_material_to_octane(mat):
             return image_textures
 
         # Process input connections from the node group
-        print(f"  Processing input connections for Principled BSDF from node group...")
+        print("  Processing input connections for Principled BSDF from node group...")
         for input_socket in cycles_principled.inputs:
             if input_socket.is_linked:
                 for link in input_socket.links:
@@ -608,19 +586,7 @@ def _convert_material_to_octane(mat):
                                 break
 
                     if octane_source_node:
-                        # Map input socket names from Cycles to Octane Universal Material
-                        # Based on the Convert_Universal_Material function indices
-                        input_mapping = {
-                            'Base Color': 5,      # Diffuse
-                            'Metallic': 7,        # Metallic
-                            'Roughness': 13,      # Roughness
-                            'Normal': None,       # Need to find the correct index
-                            'Alpha': 43,          # Opacity
-                            'Specular IOR Level': 10,  # Specular
-                            'IOR': 18,            # IOR
-                            'Anisotropic': 14,    # Anisotropy
-                            'Anisotropic Rotation': 15,  # Anisotropy Rotation
-                        }
+                        input_mapping = UNIVERSAL_MATERIAL_INPUT_INDICES
 
                         # Try to connect by socket index (more reliable for Universal Material)
                         if input_socket.name in input_mapping:
@@ -643,7 +609,7 @@ def _convert_material_to_octane(mat):
                                     output_socket_name = "Texture out" if "Texture out" in octane_source_node.outputs else octane_source_node.outputs[0].name
                                     links.new(octane_source_node.outputs[output_socket_name], Universal_node.inputs[input_socket.name])
                                     print(f"      ✓ Connected by name: {octane_source_node.name}.{output_socket_name} -> {Universal_node.name}.{input_socket.name}")
-                            except:
+                            except Exception:
                                 print(f"      ! No mapping found for input '{input_socket.name}'")
                     else:
                         print(f"      ! No matching Octane node found for '{source_node.name}'")
@@ -657,7 +623,7 @@ def _convert_material_to_octane(mat):
         existing_Octane_Invert = None
         for n in c_nodes_tree.nodes:
             if n.bl_idname == "OctaneInvertTexture" and n.label == Cycles_invert.label:
-                existing_Octane_Invert
+                existing_Octane_Invert = n
                 break
         if not existing_Octane_Invert:
             existing_Octane_Invert = c_nodes_tree.nodes.new("OctaneInvertTexture")
@@ -665,84 +631,8 @@ def _convert_material_to_octane(mat):
         existing_Octane_Invert.location = (Cycles_invert.location[0] + 1650, Cycles_invert.location[1])
         existing_Octane_Invert.label = Cycles_invert.label
 
-    # Separate Color / Separate RGB Node
-    # Blender outputs up to 3 channels (R/G/B or H/S/V or H/S/L) from ONE node,
-    # but OctaneChannelPicker only has a single output - so we need one Channel
-    # Picker per USED output, each configured to pick the matching channel.
-    # The actual links (Input <- upstream, Texture out -> downstream) are wired
-    # later by rebuild_octane_separate_color_connections(), once every other
-    # Octane node has been created.
-    separate_channel_index_map = {0: '1', 1: '2', 2: '3'}
-    separate_conversion_map = {'RGB': 'No conversion', 'HSV': 'HSV|RGB to HSV', 'HSL': 'HSL|RGB to HSL'}
-    for Cycles_separate in Cycles_Separate_Color:
-        separate_mode = getattr(Cycles_separate, 'mode', 'RGB')
-        separate_conversion_value = separate_conversion_map.get(separate_mode, 'No conversion')
-
-        for ch_index in range(min(3, len(Cycles_separate.outputs))):
-            if not Cycles_separate.outputs[ch_index].is_linked:
-                continue
-
-            picker_name = f"{Cycles_separate.name}__ch{ch_index}"
-            Octane_Channel_Picker = c_nodes_tree.nodes.get(picker_name)
-            if not Octane_Channel_Picker:
-                Octane_Channel_Picker = c_nodes_tree.nodes.new("OctaneChannelPicker")
-                Octane_Channel_Picker.name = picker_name
-
-            Octane_Channel_Picker.label = Cycles_separate.label
-            Octane_Channel_Picker.location = (Cycles_separate.location[0] + 1650, Cycles_separate.location[1] - ch_index * 150)
-            Octane_Channel_Picker.inputs["Channel"].default_value = separate_channel_index_map[ch_index]
-            Octane_Channel_Picker.inputs["Conversion"].default_value = separate_conversion_value
-
-    # Math Node - only Add/Subtract/Multiply have a confirmed-working, texture-domain
-    # equivalent in Octane. OctaneCyclesNodeMathNodeWrapper, OctaneBinaryMathOperation
-    # and OctaneComparison all exist in the API with plausible-looking sockets, but
-    # real-render testing showed none of them actually evaluate for texture/RGB
-    # inputs in Octane (BinaryMathOperation is for scalar/coordinate math only, and
-    # Comparison/the Wrapper simply don't render). Everything else Blender's Math
-    # node can do (Divide, Less Than, Power, ...) has no known working native
-    # equivalent yet, so those Math nodes are intentionally left unconverted -
-    # better than wiring up a node that silently renders nothing.
-    # Vector Math is paused entirely for the same reason (same Wrapper family).
-    math_op_to_octane_bl_idname = {
-        'ADD': 'OctaneAddTexture',
-        'SUBTRACT': 'OctaneSubtractTexture',
-        'MULTIPLY': 'OctaneMultiplyTexture',
-    }
-    for Cycles_math in Cycles_Math_Nodes:
-        octane_math_bl_idname = math_op_to_octane_bl_idname.get(Cycles_math.operation)
-        if not octane_math_bl_idname:
-            continue
-
-        Octane_Math_Name = f"{Cycles_math.name} [Octane {Cycles_math.operation.title()}]"
-        Octane_Math = None
-        for n in c_nodes_tree.nodes:
-            if n.bl_idname == octane_math_bl_idname and n.name == Octane_Math_Name:
-                Octane_Math = n
-                break
-        if not Octane_Math:
-            Octane_Math = c_nodes_tree.nodes.new(octane_math_bl_idname)
-            Octane_Math.name = Octane_Math_Name
-            Octane_Math.location = (Cycles_math.location[0] + 1650, Cycles_math.location[1])
-
-        Octane_Math.label = Cycles_math.label
-
-        # "Texture 1"/"Texture 2" are link-only sockets - no constant default value.
-        # If a Value input wasn't linked in Cycles (just a bare number), materialize
-        # it as a small OctaneFloatValue and wire that in directly here, since the
-        # generic rebuild pass only reconnects actual Cycles node-to-node links.
-        for octane_socket_name, cycles_input in (("Texture 1", Cycles_math.inputs[0]), ("Texture 2", Cycles_math.inputs[1])):
-            if cycles_input.is_linked:
-                continue
-            const_name = f"{Octane_Math_Name} {octane_socket_name} constant"
-            const_node = c_nodes_tree.nodes.get(const_name)
-            if not const_node:
-                const_node = c_nodes_tree.nodes.new("OctaneFloatValue")
-                const_node.name = const_name
-                y_offset = 0 if octane_socket_name == "Texture 1" else -150
-                const_node.location = (Octane_Math.location[0] - 300, Octane_Math.location[1] + y_offset)
-            const_node.label = f"{Cycles_math.label} constant"
-            const_node.a_value = (cycles_input.default_value,) * 3  # a_value is a 3-component array even on "Float" value nodes
-            links.new(const_node.outputs["Float out"], Octane_Math.inputs[octane_socket_name])
+    apply_octane_separate_color(mat, Cycles_Separate_Color)
+    apply_octane_math_nodes(mat, Cycles_Math_Nodes)
 
     # RGB Node (constant color source)
     for Cycles_rgb in Cycles_RGB_Nodes:
@@ -778,39 +668,11 @@ def _convert_material_to_octane(mat):
 
     #Mix color Node
     for Cycles_mix_color_node in Cycles_Color_Mix:
-
-
-        blend_type_mapping = {
-            'DARKEN': 'Darken',
-            'MULTIPLY': 'Multiply',
-            'COLOR_BURN': 'Color Burn',
-            'LINEAR_BURN': 'Linear Burn',
-            'LIGHTEN': 'Lighten',
-            'SCREEN': 'Screen',
-            'COLOR_DODGE': 'Color Dodge',
-            'ADD': 'Add',
-            'OVERLAY': 'Overlay',
-            'SOFT_LIGHT': 'Soft Light',
-            'HARD_LIGHT': 'Hard Light',
-            'VIVID_LIGHT': 'Vivid Light',
-            'LINEAR_LIGHT': 'Linear Light',
-            'PIN_LIGHT': 'Pin Light',
-            'HARD_MIX': 'Hard Mix',
-            'DIFFERENCE': 'Difference',
-            'EXCLUSION': 'Exclusion',
-            'SUBTRACT': 'Subtract',
-            'DIVIDE': 'Divide',
-            'HUE': 'Hue',
-            'SATURATION': 'Saturation',
-            'COLOR': 'Color',
-            'LUMINOSITY': 'Luminosity'
-        }
-
         if Cycles_mix_color_node.data_type == 'RGBA':
             Octane_mix_name = Cycles_mix_color_node.name.replace("Mix","Octane CyclesMixColorNode Wrapper")
             Octane_mix_color = None
             for n in c_nodes_tree.nodes:
-                if n.bl_idname == "OctaneCyclesMixColorNodeWrapper" and Octane_mix_name in Cycles_mix_color_node.name:
+                if n.bl_idname == "OctaneCyclesMixColorNodeWrapper" and n.name == Octane_mix_name:
                     Octane_mix_color = n
                     break
             if not Octane_mix_color:
@@ -818,7 +680,7 @@ def _convert_material_to_octane(mat):
 
             Octane_mix_color.name = Octane_mix_name
             Octane_mix_color.label = Cycles_mix_color_node.label
-            Octane_mix_color.inputs[0].default_value = blend_type_mapping.get(Cycles_mix_color_node.blend_type.upper(), 'Mix')  # Default to 'Mix' if not found
+            Octane_mix_color.inputs[0].default_value = BLEND_TYPE_MAPPING.get(Cycles_mix_color_node.blend_type.upper(), 'Mix')
 
             Octane_mix_color.location = (Cycles_mix_color_node.location[0] + 1650, Cycles_mix_color_node.location[1])
             Octane_mix_color.inputs[6].default_value = Cycles_mix_color_node.inputs[6].default_value[:3]
@@ -855,13 +717,7 @@ def _convert_material_to_octane(mat):
                 Octane_Mix_Vector.label = Cycles_mix_color_node.label
                 Octane_Mix_Vector.location = (Cycles_mix_color_node.location[0] + 1650, Cycles_mix_color_node.location[1])
             Octane_Mix_Vector.name = Octane_Mix_Name_Vector
-            mode_mapping = {
-              "UNIFORM": "Uniform",
-              "NON_UNIFORM": "Non-Uniform",
-
-            }
-
-            Octane_Mix_Vector.inputs[0].default_value = mode_mapping.get(Cycles_mix_color_node.factor_mode, Cycles_mix_color_node.factor_mode)
+            Octane_Mix_Vector.inputs[0].default_value = VECTOR_MODE_MAPPING.get(Cycles_mix_color_node.factor_mode, Cycles_mix_color_node.factor_mode)
 
             Octane_Mix_Vector.inputs[2].default_value = Cycles_mix_color_node.clamp_factor
             Octane_Mix_Vector.inputs[3].default_value = Cycles_mix_color_node.inputs[0].default_value
@@ -871,7 +727,6 @@ def _convert_material_to_octane(mat):
 
     #Displacement
     Displacement_texture = [node for node in nodes if node.bl_idname.startswith("OctaneRGBImage") and node.label.lower() == "displacement"]
-    Displacement_node = [node for node in nodes if ("OctaneTextureDisplacement" in node.bl_idname or "OctaneVertexDisplacement" in node.bl_idname) and ("displacement" in node.label.lower() or "COLOR * AO" in node.label)]
 
     for Node_Disp in Cycles_Displacement:
         Octane_Displacement = None
@@ -950,49 +805,20 @@ def _convert_material_to_octane(mat):
             Octane_Gradient_map.name = Octane_Gradient_name
             Octane_Gradient_map.label = val_to_rgb.label
         octane_helper = bpy.data.node_groups.get(".[OCTANE_HELPER_NODE_GROUP]")
-
-        octane_name = Octane_Gradient_map.color_ramp_name
-        ramp_items = octane_helper.nodes[octane_name].color_ramp.elements
-
-        for i in range(num_elements):
-            elements = node_c.elements[i]
-            if i >= len(ramp_items):
-                ramp_items.new(elements.position)
-            ramp_items[i].position = elements.position
-            ramp_items[i].color = elements.color
-            ramp_items[i].position = elements.position
-            ramp_items[i].color = elements.color
+        octane_name = getattr(Octane_Gradient_map, "color_ramp_name", "")
+        if octane_helper and octane_name and octane_name in octane_helper.nodes:
+            helper_node = octane_helper.nodes[octane_name]
+            if hasattr(helper_node, "color_ramp"):
+                ramp_items = helper_node.color_ramp.elements
+                for i in range(num_elements):
+                    elements = node_c.elements[i]
+                    if i >= len(ramp_items):
+                        ramp_items.new(elements.position)
+                    ramp_items[i].position = elements.position
+                    ramp_items[i].color = elements.color
 
     # Mapping:
-    for Cycles_Mapping_Node in Cycles_Mapping_Nodes:
-        Octane_Mapping_Name = Cycles_Mapping_Node.name.replace("Mapping","3D transformation")
-        Octane_Mapping = None
-        for n in c_nodes_tree.nodes:
-            if n.bl_idname == "Octane3DTransformation" and n.name == Octane_Mapping_Name:
-                Octane_Mapping = n
-                continue
-        if not Octane_Mapping:
-            Octane_Mapping = c_nodes_tree.nodes.new("Octane3DTransformation")
-            Octane_Mapping.location = (Cycles_Mapping_Node.location[0] + 1650, Cycles_Mapping_Node.location[1])
-            Octane_Mapping.name = Octane_Mapping_Name
-
-        Octane_Mapping.label = Cycles_Mapping_Node.label
-        radians_to_degrees = lambda x: x * 180.0 / math.pi
-
-        #Rotation
-        Octane_Mapping.inputs[1].default_value[0] = radians_to_degrees(Cycles_Mapping_Node.inputs[2].default_value[0])
-        Octane_Mapping.inputs[1].default_value[1] = radians_to_degrees(Cycles_Mapping_Node.inputs[2].default_value[1])
-        Octane_Mapping.inputs[1].default_value[2] = radians_to_degrees(Cycles_Mapping_Node.inputs[2].default_value[2])
-
-        #Scale
-        Octane_Mapping.inputs[2].default_value[0] = 1 / (Cycles_Mapping_Node.inputs[3].default_value[0])
-        Octane_Mapping.inputs[2].default_value[1] = 1 / (Cycles_Mapping_Node.inputs[3].default_value[1])
-        Octane_Mapping.inputs[2].default_value[2] = 1 / (Cycles_Mapping_Node.inputs[3].default_value[2])
-
-        #Location
-        Octane_Mapping.inputs[3].default_value[0] = Cycles_Mapping_Node.inputs[1].default_value[0]
-        Octane_Mapping.inputs[3].default_value[1] = Cycles_Mapping_Node.inputs[1].default_value[1]
-        Octane_Mapping.inputs[3].default_value[2] = Cycles_Mapping_Node.inputs[1].default_value[2]
+    apply_octane_mapping_nodes(mat, Cycles_Mapping_Nodes)
 
     Cycles_Translucent = False
     for Cycles_Translusency in Cycles_Translusency_nodes:
@@ -1004,15 +830,6 @@ def _convert_material_to_octane(mat):
                     BSDF_help = node_BSDF_help
 
                     break
-            Mix_Node_Translusency = None
-            for output in Cycles_Translusency.outputs:
-                for link in output.links:
-                    # Sprawdź, czy link prowadzi do ShaderNodeMixShader
-                    if link.to_node.bl_idname == "ShaderNodeMixShader":
-                        Mix_Node_Translusency = link.to_node
-                        break
-
-
 
             Octane_Translusency_Name = Cycles_Translusency.name.replace("Translucent BSDF","Universal material")
             Octane_Translusency = None
@@ -1034,8 +851,8 @@ def _convert_material_to_octane(mat):
             #Transmission Color:
             if not Cycles_Translusency.inputs[0].is_linked:
                 Octane_Trans_Color = None
-                for nodes in c_nodes_tree.nodes:
-                    if n.bl_idname == "OctaneRGBColor" and  n.label == "Octane Color Transmision":
+                for n in c_nodes_tree.nodes:
+                    if n.bl_idname == "OctaneRGBColor" and n.label == "Octane Color Transmission":
                         Octane_Trans_Color = n
                         continue
                 if not Octane_Trans_Color:
@@ -1099,8 +916,8 @@ def _convert_material_to_octane(mat):
         #Transmission Color:
         if not Cycles_Glass_node.inputs[0].is_linked:
             Octane_Trans_Color = None
-            for nodes in c_nodes_tree.nodes:
-                if n.bl_idname == "OctaneRGBColor" and  n.label == "Octane Color Transmision":
+            for n in c_nodes_tree.nodes:
+                if n.bl_idname == "OctaneRGBColor" and n.label == "Octane Color Transmission":
                     Octane_Trans_Color = n
                     continue
             if not Octane_Trans_Color:
@@ -1120,47 +937,40 @@ def _convert_material_to_octane(mat):
         #Fresnel IOR
         Octane_Glass.inputs[18].value =  Cycles_Glass_node.inputs[2].default_value
     if not Cycles_Glass and not Cycles_Translucent:
-        Layered_Material = None
+        last_universal_node = None
+        for cycles_principled in Cycles_principled_nodes:
+            if Chosen_material == "UNIVERSAL":
+                Universal_node = Convert_Universal_Material(cycles_principled, c_nodes_tree, preferences)
+                if cycles_principled.distribution == "GGX":
+                    Universal_node.inputs["BSDF model"].default_value = "GGX"
+                elif cycles_principled.distribution == "MULTI_GGX":
+                    Universal_node.inputs["BSDF model"].default_value = "GGX (energy preserving)"
+            else:
+                Universal_node = Convert_Standard_Material(cycles_principled, c_nodes_tree, preferences)
+            last_universal_node = Universal_node
 
+        Layered_Material = None
         for Mix_Shader_Node in Cycles_ShaderMix_nodes:
-            Layered_octane = None
-            Mix_Octane_Name = Mix_Shader_Node.name.replace("Mix Shader","Mix material")
-            for n in c_nodes_tree.nodes:
-                if n.bl_idname == "OctaneMixMaterial" and n.name == Mix_Octane_Name:
-                    Layered_octane = n
-                    continue
+            Mix_Octane_Name = Mix_Shader_Node.name.replace("Mix Shader", "Mix material")
+            Layered_octane = next(
+                (n for n in c_nodes_tree.nodes if n.bl_idname == "OctaneMixMaterial" and n.name == Mix_Octane_Name),
+                None,
+            )
             if not Layered_octane:
                 Layered_octane = c_nodes_tree.nodes.new("OctaneMixMaterial")
-                Layered_octane.location = (Mix_Shader_Node.location[0] +1650 , Mix_Shader_Node.location[1])
+                Layered_octane.location = (Mix_Shader_Node.location[0] + 1650, Mix_Shader_Node.location[1])
                 Layered_octane.label = Mix_Shader_Node.label
                 Layered_octane.name = Mix_Octane_Name
 
             Layered_octane.inputs[0].default_value = Mix_Shader_Node.inputs[0].default_value
-            for cycles_principled in Cycles_principled_nodes:
-                if Chosen_material == "UNIVERSAL":
-                    Universal_node = Convert_Universal_Material(cycles_principled, c_nodes_tree, preferences)
-                    if cycles_principled.distribution == "GGX":
-                        Universal_node.inputs["BSDF model"].default_value = "GGX"
-                    if cycles_principled.distribution == "MULTI_GGX":
-                        Universal_node.inputs["BSDF model"].default_value = "GGX (energy preserving)"
+            Layered_Material = Layered_octane
 
-                else:
-                    Universal_node = Convert_Standard_Material(cycles_principled, c_nodes_tree, preferences)
-
-        if not Layered_Material:
-            for cycles_principled in Cycles_principled_nodes:
-                if Chosen_material == "UNIVERSAL":
-                    Universal_node = Convert_Universal_Material(cycles_principled, c_nodes_tree, preferences)
-                    if cycles_principled.distribution == "GGX":
-                        Universal_node.inputs["BSDF model"].default_value = "GGX"
-                    if cycles_principled.distribution == "MULTI_GGX":
-                        Universal_node.inputs["BSDF model"].default_value = "GGX (energy preserving)"
-                else:
-                    Universal_node = Convert_Standard_Material(cycles_principled, c_nodes_tree, preferences)
-
-                c_nodes_tree.links.new(Universal_node.outputs[0],Octane_Output.inputs[0])
-
-                Octane_Output.location = (Universal_node.location[0] + 300, Universal_node.location[1])
+        if Layered_Material:
+            c_nodes_tree.links.new(Layered_Material.outputs[0], Octane_Output.inputs[0])
+            Octane_Output.location = (Layered_Material.location[0] + 300, Layered_Material.location[1])
+        elif last_universal_node:
+            c_nodes_tree.links.new(last_universal_node.outputs[0], Octane_Output.inputs[0])
+            Octane_Output.location = (last_universal_node.location[0] + 300, last_universal_node.location[1])
 
     ensure_main_material(mat, preferences, Chosen_material)
 
