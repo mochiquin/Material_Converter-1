@@ -19,6 +19,8 @@ from ..executor.octane_executor import (
     apply_octane_math_nodes,
     apply_octane_separate_color,
     log_material_audit_warnings,
+    prune_unconnected_octane_nodes,
+    set_octane_float_value,
 )
 from ..scripts.connect_nodes import (
     Connect_Alpha_Clip_Texture,
@@ -333,7 +335,6 @@ def _convert_material_to_octane(mat):
     Cycles_principled_nodes = [node for node in c_nodes_tree.nodes if node.bl_idname.startswith("ShaderNodeBsdfPrincipled")]
     Cycles_Color_Mix = [node for node in c_nodes_tree.nodes if node.bl_idname == "ShaderNodeMix"]
     Cycles_Glass_nodes = [node for node in c_nodes_tree.nodes if node.bl_idname.startswith("ShaderNodeBsdfGlass")]
-    Cycles_ShaderMix_nodes = [node for node in c_nodes_tree.nodes if node.bl_idname == "ShaderNodeMixShader"]
     Cycles_HSV_nodes = [node for node in c_nodes_tree.nodes if node.bl_idname.startswith("ShaderNodeHueSaturation")]
     val_to_rgb_nodes = [node for node in c_nodes_tree.nodes if node.bl_idname.startswith("ShaderNodeValToRGB")]
     Cycles_Mapping_Nodes = [node for node in c_nodes_tree.nodes if node.bl_idname.startswith("ShaderNodeMapping")]
@@ -677,7 +678,9 @@ def _convert_material_to_octane(mat):
             Octane_Value.location = (Cycles_value.location[0] + 1650, Cycles_value.location[1])
 
         Octane_Value.label = Cycles_value.label
-        Octane_Value.a_value = (Cycles_value.outputs[0].default_value,) * 3  # a_value is a 3-component array even on "Float" value nodes
+        # a_value is FLOAT4 on Blender 5.2 / Octane 2026 and FLOAT3 on older
+        # builds; set_octane_float_value matches whatever width is installed.
+        set_octane_float_value(Octane_Value, Cycles_value.outputs[0].default_value)
 
     #Mix color Node
     for Cycles_mix_color_node in Cycles_Color_Mix:
@@ -833,154 +836,228 @@ def _convert_material_to_octane(mat):
     # Mapping:
     apply_octane_mapping_nodes(mat, Cycles_Mapping_Nodes)
 
-    Cycles_Translucent = False
+    # ------------------------------------------------------------------
+    # Shader conversion + Mix Shader reconstruction.
+    #
+    # Every shader that is actually reachable from the surface output is
+    # converted exactly once (so no unused duplicates end up in the tree),
+    # and every Mix Shader becomes an Octane Mix material with BOTH branches
+    # wired in - the old code converted glass/translucent OR principled and
+    # silently dropped the rest of the graph.
+    # ------------------------------------------------------------------
+    def _reachable_shaders(root, depth=0, seen=None, found=None):
+        if seen is None:
+            seen, found = set(), []
+        if root is None or depth > 32 or root.name in seen:
+            return found
+        seen.add(root.name)
+        found.append(root)
+        if root.bl_idname == "ShaderNodeMixShader":
+            for socket_index in (1, 2):
+                socket = root.inputs[socket_index]
+                if socket.is_linked:
+                    _reachable_shaders(socket.links[0].from_node, depth + 1, seen, found)
+        return found
+
+    cycles_root_shader = None
+    for output_node in Cycles_Output_nodes:
+        if getattr(output_node, "label", "") == "Octane Output":
+            continue
+        if output_node.inputs and output_node.inputs[0].is_linked:
+            cycles_root_shader = output_node.inputs[0].links[0].from_node
+            break
+
+    reachable_shaders = _reachable_shaders(cycles_root_shader)
+    reachable_names = {node.name for node in reachable_shaders}
+
+    def _is_reachable(node):
+        # If the surface output is unlinked (or feeds something exotic), fall
+        # back to converting everything, which matches the previous behaviour.
+        return not reachable_names or node.name in reachable_names
+
+    octane_material_by_cycles: dict[str, object] = {}
+
+    def _register_octane_material(cycles_node, octane_node):
+        octane_material_by_cycles[cycles_node.name] = octane_node
+        return octane_node
+
+    def _unique_transmission_color(octane_material, cycles_node, replace_token):
+        """One transmission-colour node per glass/translucent shader.
+
+        The old code reused a single node matching the shared label, so a
+        material combining glass + translucent ended up with both materials
+        driven by one RGB node.
+        """
+        name = f"{cycles_node.name} [Transmission color]"
+        color_node = next(
+            (n for n in c_nodes_tree.nodes if n.bl_idname == "OctaneRGBColor" and n.name == name),
+            None,
+        )
+        if color_node is None:
+            color_node = c_nodes_tree.nodes.new("OctaneRGBColor")
+            color_node.name = name
+            color_node.label = "Octane Color Transmission"
+        color_node.location = (octane_material.location[0] - 300, octane_material.location[1] - 75)
+        color_node.a_value = cycles_node.inputs[0].default_value[:3]
+        c_nodes_tree.links.new(color_node.outputs[0], octane_material.inputs[1])
+        return color_node
+
+    # ---- Principled BSDF -------------------------------------------------
+    # Converted FIRST so its Octane material is the first "Material"-labelled
+    # node in the tree; Connect_To_Material() then wires textures into the
+    # Principled branch rather than into whichever glass/translucent material
+    # happened to be created first.
+    last_universal_node = None
+    for cycles_principled in Cycles_principled_nodes:
+        if not _is_reachable(cycles_principled):
+            continue
+        if Chosen_material == "UNIVERSAL":
+            Universal_node = Convert_Universal_Material(cycles_principled, c_nodes_tree, preferences)
+            if cycles_principled.distribution == "GGX":
+                Universal_node.inputs["BSDF model"].default_value = "GGX"
+            elif cycles_principled.distribution == "MULTI_GGX":
+                Universal_node.inputs["BSDF model"].default_value = "GGX (energy preserving)"
+        else:
+            Universal_node = Convert_Standard_Material(cycles_principled, c_nodes_tree, preferences)
+        _register_octane_material(cycles_principled, Universal_node)
+        last_universal_node = Universal_node
+
+    # ---- Translucent BSDF ------------------------------------------------
     for Cycles_Translusency in Cycles_Translusency_nodes:
-            Cycles_Translucent = True
-            BSDF_help = None
-            for node_BSDF_help in Cycles_principled_nodes:
-                if node_BSDF_help in Cycles_principled_nodes:
+        if not _is_reachable(Cycles_Translusency):
+            continue
+        BSDF_help = next(
+            (node for node in Cycles_principled_nodes if _is_reachable(node)),
+            None,
+        )
 
-                    BSDF_help = node_BSDF_help
+        # Must not be "Universal material": a Principled BSDF in the same graph
+        # already owns that name, and reusing it silently merged the glass and
+        # diffuse branches into one material node.
+        Octane_Translusency_Name = Cycles_Translusency.name.replace("Translucent BSDF", "Translucent material")
+        Octane_Translusency = next(
+            (
+                n
+                for n in c_nodes_tree.nodes
+                if n.bl_idname == "OctaneUniversalMaterial" and n.name == Octane_Translusency_Name
+            ),
+            None,
+        )
+        if not Octane_Translusency:
+            Octane_Translusency = c_nodes_tree.nodes.new("OctaneUniversalMaterial")
+            Octane_Translusency.location = (Cycles_Translusency.location[0] + 1650, Cycles_Translusency.location[1])
+            Octane_Translusency.label = Cycles_Translusency.label
+            Octane_Translusency.name = Octane_Translusency_Name
 
-                    break
+        Octane_Translusency.inputs[2].default_value = "Diffuse"
+        _register_octane_material(Cycles_Translusency, Octane_Translusency)
 
-            Octane_Translusency_Name = Cycles_Translusency.name.replace("Translucent BSDF","Universal material")
-            Octane_Translusency = None
+        if not Cycles_Translusency.inputs[0].is_linked:
+            _unique_transmission_color(Octane_Translusency, Cycles_Translusency, "Translucent BSDF")
 
+        if BSDF_help:
+            # Alpha
+            _set_input_val(Octane_Translusency, "Opacity", 43, BSDF_help.inputs["Alpha"].default_value if "Alpha" in BSDF_help.inputs else BSDF_help.inputs[4].default_value)
+            # Diffuse
+            _set_input_val(Octane_Translusency, ("Albedo", "Diffuse"), 5, BSDF_help.inputs["Base Color"].default_value[:3] if "Base Color" in BSDF_help.inputs else BSDF_help.inputs[0].default_value[:3])
+            # Glossiness / Roughness
+            _set_input_val(Octane_Translusency, "Roughness", 13, BSDF_help.inputs["Roughness"].default_value if "Roughness" in BSDF_help.inputs else BSDF_help.inputs[2].default_value)
+            # Fresnel IOR
+            _set_input_val(Octane_Translusency, ("Dielectric IOR", "IOR"), 18, BSDF_help.inputs["IOR"].default_value if "IOR" in BSDF_help.inputs else BSDF_help.inputs[3].default_value)
+            # Metalness
+            _set_input_val(Octane_Translusency, "Metallic", 7, BSDF_help.inputs["Metallic"].default_value if "Metallic" in BSDF_help.inputs else BSDF_help.inputs[1].default_value)
 
-            for n in c_nodes_tree.nodes:
-                if n.bl_idname == "OctaneUniversalMaterial" and n.name == Octane_Translusency_Name:
-                    Octane_Translusency = n
-                    continue
-            if not Octane_Translusency:
-                Octane_Translusency = c_nodes_tree.nodes.new("OctaneUniversalMaterial")
-                Octane_Translusency.location = (Cycles_Translusency.location[0] +1650 , Cycles_Translusency.location[1])
-                Octane_Translusency.label = Cycles_Translusency.label
-                Octane_Translusency.name = Octane_Translusency_Name
-
-            Octane_Translusency.inputs[2].default_value = "Diffuse"
-
-
-            #Transmission Color:
-            if not Cycles_Translusency.inputs[0].is_linked:
-                Octane_Trans_Color = None
-                for n in c_nodes_tree.nodes:
-                    if n.bl_idname == "OctaneRGBColor" and n.label == "Octane Color Transmission":
-                        Octane_Trans_Color = n
-                        continue
-                if not Octane_Trans_Color:
-                    Octane_Trans_Color = c_nodes_tree.nodes.new("OctaneRGBColor")
-                    Octane_Trans_Color.label = "Octane Color Transmission"
-                Octane_Trans_Color.location = (Octane_Translusency.location[0] -300 , Octane_Translusency.location[1] -75)
-                Octane_Trans_Color.a_value = Cycles_Translusency.inputs[0].default_value[:3]
-                c_nodes_tree.links.new(Octane_Trans_Color.outputs[0], Octane_Translusency.inputs[1])
-
-
-            #Octane_output
-            c_nodes_tree.links.new(Octane_Translusency.outputs[0],Octane_Output.inputs[0])
-
-            Octane_Output.location = (Octane_Translusency.location[0] + 300, Octane_Translusency.location[1])
-
-            if BSDF_help:
-                # Alpha
-                _set_input_val(Octane_Translusency, "Opacity", 43, BSDF_help.inputs["Alpha"].default_value if "Alpha" in BSDF_help.inputs else BSDF_help.inputs[4].default_value)
-                # Diffuse
-                _set_input_val(Octane_Translusency, ("Albedo", "Diffuse"), 5, BSDF_help.inputs["Base Color"].default_value[:3] if "Base Color" in BSDF_help.inputs else BSDF_help.inputs[0].default_value[:3])
-                # Glossiness / Roughness
-                _set_input_val(Octane_Translusency, "Roughness", 13, BSDF_help.inputs["Roughness"].default_value if "Roughness" in BSDF_help.inputs else BSDF_help.inputs[2].default_value)
-                # Fresnel IOR
-                _set_input_val(Octane_Translusency, ("Dielectric IOR", "IOR"), 18, BSDF_help.inputs["IOR"].default_value if "IOR" in BSDF_help.inputs else BSDF_help.inputs[3].default_value)
-                # Metalness
-                _set_input_val(Octane_Translusency, "Metallic", 7, BSDF_help.inputs["Metallic"].default_value if "Metallic" in BSDF_help.inputs else BSDF_help.inputs[1].default_value)
-
-    Cycles_Glass = False
+    # ---- Glass BSDF ------------------------------------------------------
     for Cycles_Glass_node in Cycles_Glass_nodes:
-        Cycles_Glass = True
-        BSDF_help = None
-        for node_BSDF_help in Cycles_principled_nodes:
-            if node_BSDF_help in Cycles_principled_nodes:
+        if not _is_reachable(Cycles_Glass_node):
+            continue
+        BSDF_help = next(
+            (node for node in Cycles_principled_nodes if _is_reachable(node)),
+            None,
+        )
 
-                BSDF_help = node_BSDF_help
-                break
-
-
-        Octane_Glass_Name = Cycles_Glass_node.name.replace("Glass BSDF","Universal material")
-        Octane_Glass = None
-
-
-        for n in c_nodes_tree.nodes:
-            if n.bl_idname == "OctaneUniversalMaterial" and n.name == Octane_Glass_Name:
-                Octane_Glass = n
-                continue
+        # See the translucent branch above: "Universal material" is the name the
+        # Principled conversion uses, so glass must get its own base name.
+        Octane_Glass_Name = Cycles_Glass_node.name.replace("Glass BSDF", "Glass material")
+        Octane_Glass = next(
+            (
+                n
+                for n in c_nodes_tree.nodes
+                if n.bl_idname == "OctaneUniversalMaterial" and n.name == Octane_Glass_Name
+            ),
+            None,
+        )
         if not Octane_Glass:
             Octane_Glass = c_nodes_tree.nodes.new("OctaneUniversalMaterial")
-            Octane_Glass.location = (Cycles_Glass_node.location[0] +1650 , Cycles_Glass_node.location[1])
+            Octane_Glass.location = (Cycles_Glass_node.location[0] + 1650, Cycles_Glass_node.location[1])
             Octane_Glass.label = Cycles_Glass_node.label
             Octane_Glass.name = Octane_Glass_Name
-
 
         _set_input_val(Octane_Glass, ("Transmission Layer", "[OctaneGroupTitle]Transmission Layer"), 2, "Specular")
         # Diffuse
         _set_input_val(Octane_Glass, ("Albedo", "Diffuse"), 5, (0.0, 0.0, 0.0))
+        _register_octane_material(Cycles_Glass_node, Octane_Glass)
 
-        # Transmission Color:
         if not Cycles_Glass_node.inputs[0].is_linked:
-            Octane_Trans_Color = None
-            for n in c_nodes_tree.nodes:
-                if n.bl_idname == "OctaneRGBColor" and n.label == "Octane Color Transmission":
-                    Octane_Trans_Color = n
-                    continue
-            if not Octane_Trans_Color:
-                Octane_Trans_Color = c_nodes_tree.nodes.new("OctaneRGBColor")
-                Octane_Trans_Color.label = "Octane Color Transmission"
-            Octane_Trans_Color.location = (Octane_Glass.location[0] - 300, Octane_Glass.location[1] - 75)
-            Octane_Trans_Color.a_value = Cycles_Glass_node.inputs[0].default_value[:3]
-            c_nodes_tree.links.new(Octane_Trans_Color.outputs[0], Octane_Glass.inputs[1])
+            _unique_transmission_color(Octane_Glass, Cycles_Glass_node, "Glass BSDF")
+
         # Roughness / Glossiness
         _set_input_val(Octane_Glass, "Roughness", 13, Cycles_Glass_node.inputs[1].default_value)
-
-        # Octane_output
-        c_nodes_tree.links.new(Octane_Glass.outputs[0], Octane_Output.inputs[0])
-
-        Octane_Output.location = (Octane_Glass.location[0] + 300, Octane_Glass.location[1])
-
         # Fresnel IOR
         _set_input_val(Octane_Glass, ("Dielectric IOR", "IOR"), 18, Cycles_Glass_node.inputs[2].default_value)
-    if not Cycles_Glass and not Cycles_Translucent:
-        last_universal_node = None
-        for cycles_principled in Cycles_principled_nodes:
-            if Chosen_material == "UNIVERSAL":
-                Universal_node = Convert_Universal_Material(cycles_principled, c_nodes_tree, preferences)
-                if cycles_principled.distribution == "GGX":
-                    Universal_node.inputs["BSDF model"].default_value = "GGX"
-                elif cycles_principled.distribution == "MULTI_GGX":
-                    Universal_node.inputs["BSDF model"].default_value = "GGX (energy preserving)"
-            else:
-                Universal_node = Convert_Standard_Material(cycles_principled, c_nodes_tree, preferences)
-            last_universal_node = Universal_node
 
-        Layered_Material = None
-        for Mix_Shader_Node in Cycles_ShaderMix_nodes:
-            Mix_Octane_Name = Mix_Shader_Node.name.replace("Mix Shader", "Mix material")
-            Layered_octane = next(
-                (n for n in c_nodes_tree.nodes if n.bl_idname == "OctaneMixMaterial" and n.name == Mix_Octane_Name),
-                None,
-            )
-            if not Layered_octane:
-                Layered_octane = c_nodes_tree.nodes.new("OctaneMixMaterial")
-                Layered_octane.location = (Mix_Shader_Node.location[0] + 1650, Mix_Shader_Node.location[1])
-                Layered_octane.label = Mix_Shader_Node.label
-                Layered_octane.name = Mix_Octane_Name
+    # ---- Mix Shader -> Octane Mix material -------------------------------
+    def _octane_for_cycles_shader(cycles_node, depth=0):
+        if cycles_node is None or depth > 32:
+            return None
+        cached = octane_material_by_cycles.get(cycles_node.name)
+        if cached is not None:
+            return cached
+        if cycles_node.bl_idname != "ShaderNodeMixShader":
+            return None
 
-            Layered_octane.inputs[0].default_value = Mix_Shader_Node.inputs[0].default_value
-            Layered_Material = Layered_octane
+        mix_name = cycles_node.name.replace("Mix Shader", "Mix material")
+        mix_node = next(
+            (n for n in c_nodes_tree.nodes if n.bl_idname == "OctaneMixMaterial" and n.name == mix_name),
+            None,
+        )
+        if mix_node is None:
+            mix_node = c_nodes_tree.nodes.new("OctaneMixMaterial")
+            mix_node.name = mix_name
+            mix_node.label = cycles_node.label
+            mix_node.location = (cycles_node.location[0] + 1650, cycles_node.location[1])
 
-        if Layered_Material:
-            c_nodes_tree.links.new(Layered_Material.outputs[0], Octane_Output.inputs[0])
-            Octane_Output.location = (Layered_Material.location[0] + 300, Layered_Material.location[1])
-        elif last_universal_node:
-            c_nodes_tree.links.new(last_universal_node.outputs[0], Octane_Output.inputs[0])
-            Octane_Output.location = (last_universal_node.location[0] + 300, last_universal_node.location[1])
+        # Cache before recursing so a malformed cyclic graph terminates.
+        octane_material_by_cycles[cycles_node.name] = mix_node
+        mix_node.inputs[0].default_value = cycles_node.inputs[0].default_value
+
+        for socket_index in (1, 2):
+            source_socket = cycles_node.inputs[socket_index]
+            if not source_socket.is_linked:
+                continue
+            branch = _octane_for_cycles_shader(source_socket.links[0].from_node, depth + 1)
+            if branch is None:
+                continue
+            for existing_link in list(mix_node.inputs[socket_index].links):
+                c_nodes_tree.links.remove(existing_link)
+            c_nodes_tree.links.new(branch.outputs[0], mix_node.inputs[socket_index])
+        return mix_node
+
+    root_octane_node = _octane_for_cycles_shader(cycles_root_shader)
+    if root_octane_node is None:
+        # Fall back to the outermost mix material, then the last converted
+        # Principled material (matches the old behaviour).
+        root_octane_node = next(
+            (n for n in octane_material_by_cycles.values() if n.bl_idname == "OctaneMixMaterial"),
+            None,
+        )
+    if root_octane_node is None:
+        root_octane_node = last_universal_node
+    if root_octane_node is not None:
+        for existing_link in list(Octane_Output.inputs[0].links):
+            c_nodes_tree.links.remove(existing_link)
+        c_nodes_tree.links.new(root_octane_node.outputs[0], Octane_Output.inputs[0])
+        Octane_Output.location = (root_octane_node.location[0] + 300, root_octane_node.location[1])
 
     ensure_main_material(mat, preferences, Chosen_material)
 
@@ -1017,3 +1094,7 @@ def _convert_material_to_octane(mat):
                     opacity_input.default_value = 1.0
                 except Exception:
                     pass
+
+    # Final cleanup: drop Octane helpers that never got wired to anything
+    # (unsupported procedural/math inputs leave their partial nodes behind).
+    prune_unconnected_octane_nodes(mat)

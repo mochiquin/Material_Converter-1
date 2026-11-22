@@ -408,9 +408,8 @@ def Connect_Vray_Mapping_Node(mat) -> None:
         mapping_node = mapping_nodes[0] if mapping_nodes else nodes.new(mapping_type)
         mapping_node.location = (image_nodes[0].location[0] - 300, image_nodes[0].location[1])
         for image in image_nodes:
-            for input_socket in image.inputs:
-                if not input_socket.is_linked:
-                    links.new(mapping_node.outputs[0], image.inputs[input_nr])
+            if input_nr < len(image.inputs) and not image.inputs[input_nr].is_linked:
+                links.new(mapping_node.outputs[0], image.inputs[input_nr])
 
 
 def label_texture_nodes(mat) -> None:
@@ -521,6 +520,8 @@ def Connect_To_Material(mat) -> None:
 
     for node in sorted(other_nodes, key=distance):
         if not node.label:
+            continue
+        if any(socket.is_linked for socket in node.outputs):
             continue
         node_label_upper = node.label.upper()
         for prefixes, input_name in prefix_to_input_name.items():

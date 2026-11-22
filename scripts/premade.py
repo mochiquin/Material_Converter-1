@@ -53,27 +53,23 @@ def label_nodes_from_base_color(mat):
                 if input.is_linked:
                     link = input.links[0]
                     # Rekursywne ustawienie etykiet na powiązanych węzłach
-                    set_labels_recursive(link.from_node, "Displacement")
+                    set_labels_recursive(link.from_node, "Displacement", visited=set())
     for node in node_tree.nodes:
-        if node.bl_idname == 'ShaderNodeBump':  # Typ Displacement
-            
+        if node.bl_idname == 'ShaderNodeBump':
             node.label = "Bump"
-            # Iteracja po połączonych węzłach
             for input in node.inputs:
                 if input.is_linked:
                     link = input.links[0]
-                    # Rekursywne ustawienie etykiet na powiązanych węzłach
-                    set_labels_recursive(link.from_node, "Bump")
-            
-            # Iteracja po połączonych węzłach
-            for input in node.inputs:
-                if input.is_linked:
-                    link = input.links[0]
-                    # Rekursywne ustawienie etykiet na powiązanych węzłach
-                    set_labels_recursive(link.from_node, "Displacement")
+                    set_labels_recursive(link.from_node, "Bump", visited=set())
     for node in node_tree.nodes:
         if node.bl_idname == "ShaderNodeBsdfTranslucent" or node.bl_idname == "ShaderNodeBsdfGlass":
-            node.label = "Material"
+            # Unique continuation of the Principled "Material"/"Material 1" labels:
+            # a shared "Material" label made the label-based rebuild pair the
+            # Principled branch with the glass material node.
+            node.label = _unique_label(node, "Material")
+    for node in node_tree.nodes:
+        if node.bl_idname == "ShaderNodeMixShader":
+            node.label = _unique_label(node, "Mix material")
     for node in node_tree.nodes:
         if node.bl_idname == "ShaderNodeNormalMap":
             node.label = "Normal"
@@ -83,8 +79,6 @@ def label_nodes_from_base_color(mat):
             index = node.label.replace("Material", "").strip()
 
             # Iteracja przez wszystkie wejścia do Principled BSDF
-            
-            
             for input_name, input in node.inputs.items():
                 if input.is_linked:
                     # Znajdź połączony węzeł
@@ -94,19 +88,45 @@ def label_nodes_from_base_color(mat):
                     label_prefix = input_prefix_map.get(input_name, input_name)
                     
                     # Przekaż indeks i prefiks do funkcji etykietującej
-                    set_labels_recursive(link.from_node, f"{index} {label_prefix}")
+                    set_labels_recursive(link.from_node, f"{index} {label_prefix}", visited=set())
         
        
-def set_labels_recursive(node, label_prefix):
+def _unique_label(node, label):
+    """Return ``label``, suffixed when another node already uses it.
+
+    Cycles <-> Octane nodes are paired by *exact* label equality during
+    connection rebuilding. Two different nodes sharing one label made that
+    pairing ambiguous, which produced self-links and cross-wired inputs
+    (e.g. two chained Math nodes both labelled " Alpha").
+    """
+    tree = getattr(node, "id_data", None)
+    if tree is None or not hasattr(tree, "nodes"):
+        return label
+    taken = {other.label for other in tree.nodes if other.name != node.name and other.label}
+    if label not in taken:
+        return label
+    index = 1
+    while f"{label} {index}" in taken:
+        index += 1
+    return f"{label} {index}"
+
+
+def set_labels_recursive(node, label_prefix, visited=None):
+    if visited is None:
+        visited = set()
+    node_id = getattr(node, "as_pointer", lambda: id(node))()
+    if node_id in visited:
+        return
+    visited.add(node_id)
     # Specjalne traktowanie dla ShaderNodeMix
     if node.bl_idname == 'ShaderNodeMix':
         if not node.label:  # Sprawdź czy etykieta już istnieje
-            node.label = f"{label_prefix}"
+            node.label = _unique_label(node, f"{label_prefix}")
         for i, input_name in enumerate(['A', 'B']):
             if node.inputs[6 + i].is_linked:
                 link = node.inputs[6 + i].links[0]
                 new_label_prefix = f"{label_prefix} {input_name}"
-                set_labels_recursive(link.from_node, new_label_prefix)
+                set_labels_recursive(link.from_node, new_label_prefix, visited=visited)
         return
     
     elif node.bl_idname == 'ShaderNodeMapping':
@@ -119,12 +139,12 @@ def set_labels_recursive(node, label_prefix):
                 "Transmission": "4",
             }
             new_label = prefix_to_label_map.get(label_prefix, label_prefix)
-            node.label = f"Mapping {new_label}"
+            node.label = _unique_label(node, f"Mapping {new_label}")
         return
    
     # Ustaw etykietę tylko jeśli jej nie ma
     if not node.label:
-        node.label = f"{label_prefix}"
+        node.label = _unique_label(node, f"{label_prefix}")
 
     # Przechodź przez podłączone węzły
     linked_inputs = [input for input in node.inputs if input.is_linked]
@@ -141,11 +161,11 @@ def set_labels_recursive(node, label_prefix):
         for input in linked_inputs:
             link = input.links[0]
             branch_suffix = input.identifier or input.name
-            set_labels_recursive(link.from_node, f"{label_prefix} {branch_suffix}")
+            set_labels_recursive(link.from_node, f"{label_prefix} {branch_suffix}", visited=visited)
     else:
         for input in linked_inputs:
             link = input.links[0]
-            set_labels_recursive(link.from_node, label_prefix)
+            set_labels_recursive(link.from_node, label_prefix, visited=visited)
 
 def Add_Mapping_Node(material):
     Render_engine_mat = bpy.context.scene.render.engine
@@ -190,10 +210,8 @@ def Add_Mapping_Node(material):
             Engine_Mapping.location = (Image_nodes[0].location[0] - 600, Image_nodes[0].location[1])
             
             for image in Image_nodes:
-                for input_socket in image.inputs:
-                    if not input_socket.is_linked:
-                 
-                        links.new(Engine_Mapping.outputs[0],image.inputs[input_nr])
+                if input_nr < len(image.inputs) and not image.inputs[input_nr].is_linked:
+                    links.new(Engine_Mapping.outputs[0], image.inputs[input_nr])
 
 def remove_reroutes_from_material(material):
     if not material or not material.use_nodes:

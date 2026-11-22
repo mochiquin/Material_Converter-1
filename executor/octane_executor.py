@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from typing import Any
 
 from ..core.graph_planner import (
@@ -19,11 +20,16 @@ from .graph_serializer import serialize_material_graph
 
 
 def log_material_audit_warnings(mat: Any) -> list[ConversionWarning]:
-    """Audit a material graph using core/ and emit explicit warnings."""
+    """Audit a material graph using core/ and emit explicit warnings.
+
+    Warnings go to stderr on purpose: ``convert_material_to_octane()`` wraps the
+    conversion in ``contextlib.redirect_stdout()`` unless Verbose is enabled, and
+    silently swallowing an unsupported-node warning is forbidden (AGENTS.md §2).
+    """
     graph = serialize_material_graph(mat)
     warnings = audit_material_graph(graph)
     for warning in warnings:
-        print(f"[Material Converter][{warning.code}] {mat.name}: {warning.message}")
+        print(f"[Material Converter][{warning.code}] {mat.name}: {warning.message}", file=sys.stderr)
     return warnings
 
 
@@ -54,6 +60,23 @@ def apply_octane_separate_color(mat: Any, separate_nodes: list[Any]) -> None:
             picker.location = plan.location
             picker.inputs["Channel"].default_value = plan.channel_index_value
             picker.inputs["Conversion"].default_value = plan.conversion_value
+
+
+def set_octane_float_value(node: Any, value: float) -> None:
+    """Assign a scalar to an Octane node's ``a_value`` attribute.
+
+    Octane's ``NT_FLOAT`` attribute is declared as a 3-component vector on some
+    Octane builds and a 4-component one on others (Blender 5.2 / Octane 2026
+    uses FLOAT4 on ``OctaneFloatValue``). Writing a hard-coded 3-tuple raises
+    ``ValueError: sequences of dimension 0 should contain 4 items, not 3`` and
+    aborts the whole material conversion, so always match the real width.
+    """
+    try:
+        width = len(node.a_value)
+    except TypeError:
+        node.a_value = float(value)
+        return
+    node.a_value = [float(value)] * width
 
 
 def apply_octane_math_nodes(mat: Any, math_nodes: list[Any]) -> list[str]:
@@ -96,7 +119,7 @@ def apply_octane_math_nodes(mat: Any, math_nodes: list[Any]) -> list[str]:
                 y_offset = 0 if octane_socket_name == "Texture 1" else -150
                 const_node.location = (octane_math.location[0] - 300, octane_math.location[1] + y_offset)
             const_node.label = f"{cycles_math.label} constant"
-            const_node.a_value = (cycles_input.default_value,) * 3
+            set_octane_float_value(const_node, cycles_input.default_value)
             links.new(const_node.outputs["Float out"], octane_math.inputs[octane_socket_name])
 
     return warnings
@@ -132,6 +155,43 @@ def apply_octane_mapping_nodes(mat: Any, mapping_nodes: list[Any]) -> None:
             octane_mapping.inputs[1].default_value[idx] = transform.rotation_deg[idx]
             octane_mapping.inputs[2].default_value[idx] = transform.scale[idx]
             octane_mapping.inputs[3].default_value[idx] = transform.translation[idx]
+
+
+def prune_unconnected_octane_nodes(mat: Any) -> list[str]:
+    """Remove Octane helper nodes that ended up feeding nothing.
+
+    Unsupported Cycles inputs leave half-built Octane counterparts behind (a
+    Subtract texture whose second operand came from an unsupported math node,
+    a 3D transformation whose only texture was procedural, ...). They can never
+    be sampled, so they are dead weight in the shader tree. Every removal is
+    reported on stderr instead of disappearing silently.
+    """
+    tree = mat.node_tree
+    nodes = tree.nodes
+    removed: list[str] = []
+    changed = True
+    while changed:
+        changed = False
+        for node in list(nodes):
+            if not node.bl_idname.startswith("Octane"):
+                continue
+            if node.bl_idname.endswith("Material"):
+                continue
+            if node.bl_idname == "OctaneChannelPicker" and "Input" in node.inputs and not node.inputs["Input"].is_linked:
+                removed.append(f"{node.bl_idname} '{node.name}' (unlinked picker input)")
+                nodes.remove(node)
+                changed = True
+                continue
+            if not node.outputs or not any(socket.is_linked for socket in node.outputs):
+                removed.append(f"{node.bl_idname} '{node.name}'")
+                nodes.remove(node)
+                changed = True
+    for entry in removed:
+        print(
+            f"[Material Converter][PRUNED] {mat.name}: removed unconnected Octane node {entry}",
+            file=sys.stderr,
+        )
+    return removed
 
 
 def apply_octane_alpha_clip_bypass(mat: Any) -> None:

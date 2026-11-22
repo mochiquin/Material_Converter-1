@@ -64,7 +64,7 @@ def auto_convert_image_nodes(scene, depsgraph) -> None:
         image_nodes = [node for node in node_tree.nodes if node.bl_idname == "ShaderNodeTexImage"]
 
         for cycles_image in image_nodes:
-            node_id = id(cycles_image)
+            node_id = cycles_image.as_pointer()
             if node_id in processed_nodes:
                 continue
 

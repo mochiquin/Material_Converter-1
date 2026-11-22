@@ -57,7 +57,7 @@ def rebuild_octane_connections(mat) -> None:
 
                         output_socket = next((s for s in octane_node.outputs if s.name == output_name), None)
                         input_socket = next((s for s in octane_target_node.inputs if s.name == input_name), None)
-                        if output_socket and input_socket:
+                        if output_socket and input_socket and octane_target_node.name != octane_node.name:
                             octane_links.new(input_socket, output_socket)
 
 
