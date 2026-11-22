@@ -3,8 +3,23 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Literal
 
 from .node_mappings import check_unsupported_cycles_node, resolve_math_node
+
+AlphaMode = Literal["RAW", "CUTOFF", "IGNORE"]
+"""How a source image's alpha channel is mapped onto Octane Opacity.
+
+``RAW``: use the image's alpha channel as-is (keeps soft, anti-aliased edges).
+``CUTOFF``: re-apply the glTF alpha-cutoff threshold as a hard step.
+``IGNORE``: leave the material fully opaque.
+"""
+
+# Half-width of the near-hard step used by the CUTOFF mode (alpha units).
+CUTOFF_STEP_HALF_WIDTH = 0.01
+
+ALPHA_MODES: tuple[str, ...] = ("RAW", "CUTOFF", "IGNORE")
+DEFAULT_ALPHA_MODE: AlphaMode = "RAW"
 
 
 @dataclass(frozen=True, slots=True)
@@ -14,6 +29,7 @@ class SerializedSocket:
     name: str
     identifier: str
     is_linked: bool = False
+    value: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,6 +52,7 @@ class SerializedNode:
     label: str = ""
     operation: str = ""
     image_name: str = ""
+    image_has_alpha: bool = True
     location: tuple[float, float] = (0.0, 0.0)
     inputs: tuple[SerializedSocket, ...] = ()
 
@@ -59,6 +76,7 @@ class ConversionWarning:
     code: str
     node_name: str
     message: str
+    severity: str = "warning"
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,6 +87,19 @@ class AlphaClipPlan:
     source_image_node: str
     source_image_name: str
     alpha_node_name: str
+    mode: AlphaMode = "RAW"
+    cutoff: float | None = None
+    step_min: float | None = None
+    step_max: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class AlphaTrace:
+    """Result of tracing a Principled BSDF's Alpha input back to an image alpha."""
+
+    image_node: str
+    chain_nodes: tuple[str, ...] = ()
+    cutoff: float | None = None
 
 
 def compute_branch_labels(graph: SerializedMaterialGraph) -> dict[str, str]:
@@ -146,13 +177,32 @@ def compute_branch_labels(graph: SerializedMaterialGraph) -> dict[str, str]:
     return labels
 
 
-def find_alpha_clip_source_image(
+def _cutoff_from_chain(
+    nodes_by_name: dict[str, SerializedNode],
+    chain: list[str],
+) -> float | None:
+    """Return the glTF alpha-cutoff constant from a LESS_THAN node in the chain."""
+    for name in chain:
+        node = nodes_by_name.get(name)
+        if node is None or node.operation != "LESS_THAN":
+            continue
+        for socket in node.inputs[:2]:
+            if not socket.is_linked and socket.value is not None:
+                return float(socket.value)
+    return None
+
+
+def trace_alpha_source(
     graph: SerializedMaterialGraph,
     principled_node_name: str,
     *,
     max_depth: int = 12,
-) -> str | None:
-    """Trace upstream from a Principled BSDF's Alpha input to a ShaderNodeTexImage."""
+) -> AlphaTrace | None:
+    """Trace a Principled BSDF's Alpha input upstream to a TexImage *Alpha* output.
+
+    Only a link leaving the image's ``Alpha`` socket counts: an image whose
+    ``Color`` output feeds Alpha is not an alpha-channel source.
+    """
     nodes_by_name = graph.node_map()
     incoming_by_node: dict[str, list[SerializedLink]] = {}
     for link in graph.links:
@@ -168,31 +218,56 @@ def find_alpha_clip_source_image(
 
     visited: set[str] = set()
 
-    def walk(node_name: str, depth: int) -> str | None:
-        if depth > max_depth or node_name in visited:
+    def walk(node_name: str, from_socket: str, depth: int, chain: list[str]) -> AlphaTrace | None:
+        if depth > max_depth:
             return None
-        visited.add(node_name)
         node = nodes_by_name.get(node_name)
         if node is None:
             return None
         if node.bl_idname == "ShaderNodeTexImage":
-            return node.name
+            if from_socket != "Alpha":
+                return None
+            return AlphaTrace(
+                image_node=node.name,
+                chain_nodes=tuple(chain),
+                cutoff=_cutoff_from_chain(nodes_by_name, chain),
+            )
+        if node_name in visited:
+            return None
+        visited.add(node_name)
         for lnk in incoming_by_node.get(node_name, []):
-            found = walk(lnk.from_node, depth + 1)
+            found = walk(lnk.from_node, lnk.from_socket, depth + 1, [*chain, node_name])
             if found is not None:
                 return found
         return None
 
-    return walk(alpha_links[0].from_node, 0)
+    first = alpha_links[0]
+    return walk(first.from_node, first.from_socket, 0, [])
+
+
+def find_alpha_clip_source_image(
+    graph: SerializedMaterialGraph,
+    principled_node_name: str,
+    *,
+    max_depth: int = 12,
+) -> str | None:
+    """Name of the TexImage whose Alpha output drives a Principled BSDF's Alpha."""
+    trace = trace_alpha_source(graph, principled_node_name, max_depth=max_depth)
+    return trace.image_node if trace else None
 
 
 def plan_alpha_clip_bypass(
     graph: SerializedMaterialGraph,
     *,
-    ignore_alpha_clip: bool,
+    alpha_mode: AlphaMode = DEFAULT_ALPHA_MODE,
 ) -> list[AlphaClipPlan]:
-    """Generate OctaneAlphaImage bypass plans for all Principled BSDF nodes."""
-    if ignore_alpha_clip:
+    """Generate OctaneAlphaImage plans for all Principled BSDF nodes.
+
+    ``RAW`` wires the image's alpha channel straight to Opacity. ``CUTOFF`` does
+    the same but records the glTF cutoff so the executor can add a hard step;
+    without a readable cutoff it degrades to ``RAW``. ``IGNORE`` plans nothing.
+    """
+    if alpha_mode == "IGNORE":
         return []
 
     nodes_by_name = graph.node_map()
@@ -200,27 +275,75 @@ def plan_alpha_clip_bypass(
     for node in graph.nodes:
         if node.bl_idname != "ShaderNodeBsdfPrincipled":
             continue
-        source_img_name = find_alpha_clip_source_image(graph, node.name)
-        if not source_img_name:
+        trace = trace_alpha_source(graph, node.name)
+        if trace is None:
             continue
-        source_node = nodes_by_name.get(source_img_name)
-        if source_node is None or not source_node.image_name:
+        source_node = nodes_by_name.get(trace.image_node)
+        if source_node is None or not source_node.image_name or not source_node.image_has_alpha:
             continue
+        use_cutoff = alpha_mode == "CUTOFF" and trace.cutoff is not None
         plans.append(
             AlphaClipPlan(
                 principled_node=node.name,
-                source_image_node=source_img_name,
+                source_image_node=trace.image_node,
                 source_image_name=source_node.image_name,
-                alpha_node_name=f"{source_img_name} [Octane Alpha Image]",
+                alpha_node_name=f"{trace.image_node} [Octane Alpha Image]",
+                mode="CUTOFF" if use_cutoff else "RAW",
+                cutoff=trace.cutoff if use_cutoff else None,
+                step_min=max(0.0, trace.cutoff - CUTOFF_STEP_HALF_WIDTH) if use_cutoff else None,
+                step_max=min(1.0, trace.cutoff + CUTOFF_STEP_HALF_WIDTH) if use_cutoff else None,
             )
         )
     return plans
 
 
-def audit_material_graph(graph: SerializedMaterialGraph) -> list[ConversionWarning]:
-    """Audit a serialized Cycles graph for known Octane conversion limitations."""
+def audit_material_graph(
+    graph: SerializedMaterialGraph,
+    *,
+    alpha_mode: AlphaMode = DEFAULT_ALPHA_MODE,
+) -> list[ConversionWarning]:
+    """Audit a serialized Cycles graph for known Octane conversion limitations.
+
+    Math nodes that only form a glTF alpha-clip chain are replaced by the alpha
+    bypass (or deliberately dropped with ``IGNORE``), so they are reported once
+    as ``ALPHA_CLIP_BYPASSED`` / ``ALPHA_IGNORED`` instead of as unsupported.
+    """
     warnings: list[ConversionWarning] = []
+    alpha_chain_nodes: set[str] = set()
+    for principled in graph.nodes:
+        if principled.bl_idname != "ShaderNodeBsdfPrincipled":
+            continue
+        trace = trace_alpha_source(graph, principled.name)
+        if trace is None:
+            continue
+        alpha_chain_nodes.update(trace.chain_nodes)
+        if alpha_mode == "IGNORE":
+            warnings.append(
+                ConversionWarning(
+                    code="ALPHA_IGNORED",
+                    node_name=principled.name,
+                    message=(
+                        f"Alpha from image node '{trace.image_node}' is ignored by the "
+                        "'Ignore' alpha mode; Opacity stays fully opaque."
+                    ),
+                )
+            )
+        elif trace.chain_nodes:
+            warnings.append(
+                ConversionWarning(
+                    code="ALPHA_CLIP_BYPASSED",
+                    node_name=principled.name,
+                    message=(
+                        f"Alpha-clip math chain {list(trace.chain_nodes)} replaced by the "
+                        f"image alpha channel of '{trace.image_node}'."
+                    ),
+                    severity="info",
+                )
+            )
+
     for node in graph.nodes:
+        if node.name in alpha_chain_nodes:
+            continue
         if node.bl_idname == "ShaderNodeMath":
             resolution = resolve_math_node(node.operation, node.name)
             if not resolution.supported and resolution.warning:

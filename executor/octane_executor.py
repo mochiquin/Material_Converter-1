@@ -6,6 +6,9 @@ import sys
 from typing import Any
 
 from ..core.graph_planner import (
+    ALPHA_MODES,
+    DEFAULT_ALPHA_MODE,
+    AlphaMode,
     ConversionWarning,
     audit_material_graph,
     plan_alpha_clip_bypass,
@@ -19,16 +22,27 @@ from .addon_helpers import get_addon_preferences
 from .graph_serializer import serialize_material_graph
 
 
+def get_alpha_mode() -> AlphaMode:
+    """Read the user's Octane alpha mode preference (defaults to RAW)."""
+    prefs = get_addon_preferences()
+    mode = getattr(getattr(prefs, "octane_preferences", None), "octane_alpha_mode", DEFAULT_ALPHA_MODE)
+    return mode if mode in ALPHA_MODES else DEFAULT_ALPHA_MODE
+
+
 def log_material_audit_warnings(mat: Any) -> list[ConversionWarning]:
     """Audit a material graph using core/ and emit explicit warnings.
 
     Warnings go to stderr on purpose: ``convert_material_to_octane()`` wraps the
     conversion in ``contextlib.redirect_stdout()`` unless Verbose is enabled, and
     silently swallowing an unsupported-node warning is forbidden (AGENTS.md §2).
+    Info-level findings (e.g. an alpha chain handled by the bypass) are returned
+    but not printed.
     """
     graph = serialize_material_graph(mat)
-    warnings = audit_material_graph(graph)
+    warnings = audit_material_graph(graph, alpha_mode=get_alpha_mode())
     for warning in warnings:
+        if warning.severity == "info":
+            continue
         print(f"[Material Converter][{warning.code}] {mat.name}: {warning.message}", file=sys.stderr)
     return warnings
 
@@ -196,12 +210,8 @@ def prune_unconnected_octane_nodes(mat: Any) -> list[str]:
 
 def apply_octane_alpha_clip_bypass(mat: Any) -> None:
     """Execute Alpha-clip bypass planned by ``core.graph_planner.plan_alpha_clip_bypass``."""
-    prefs = get_addon_preferences()
-    ignore_alpha = bool(
-        prefs and getattr(prefs.octane_preferences, "octane_ignore_alpha_clip", False)
-    )
     graph = serialize_material_graph(mat)
-    plans = plan_alpha_clip_bypass(graph, ignore_alpha_clip=ignore_alpha)
+    plans = plan_alpha_clip_bypass(graph, alpha_mode=get_alpha_mode())
     if not plans:
         return
 
@@ -244,4 +254,25 @@ def apply_octane_alpha_clip_bypass(mat: Any) -> None:
         octane_alpha_image.label = f"{image_node.label} Alpha".strip() if image_node.label else "Alpha"
         octane_alpha_image.image = image_node.image
         octane_alpha_image.inputs["Legacy gamma"].default_value = 1.0
-        links.new(octane_alpha_image.outputs[0], octane_material.inputs["Opacity"])
+
+        opacity_source = octane_alpha_image
+        if plan.mode == "CUTOFF" and plan.step_min is not None and plan.step_max is not None:
+            step_name = f"{plan.alpha_node_name} Cutoff"
+            step = nodes.get(step_name)
+            if not step:
+                step = nodes.new("OctaneRange")
+                step.name = step_name
+            step.label = f"Alpha Cutoff {plan.cutoff:g}"
+            step.location = (
+                octane_alpha_image.location[0] + 250,
+                octane_alpha_image.location[1],
+            )
+            step.inputs["Input minimum"].default_value = plan.step_min
+            step.inputs["Input maximum"].default_value = plan.step_max
+            step.inputs["Output minimum"].default_value = 0.0
+            step.inputs["Output maximum"].default_value = 1.0
+            step.inputs["Clamp"].default_value = True
+            links.new(octane_alpha_image.outputs[0], step.inputs["Value"])
+            opacity_source = step
+
+        links.new(opacity_source.outputs[0], octane_material.inputs["Opacity"])

@@ -243,6 +243,7 @@ def plan_separate_color_pickers(
 ) -> list[SeparatePickerPlan]:
     """Plan one OctaneChannelPicker per linked output channel (R/G/B or H/S/V)."""
     conversion_value = SEPARATE_CONVERSION_MAP.get(mode, "No conversion")
+    channel_letters = mode if len(mode) == 3 else "RGB"
     plans: list[SeparatePickerPlan] = []
     for ch_index in linked_output_indices:
         if ch_index not in SEPARATE_CHANNEL_INDEX_MAP:
@@ -250,7 +251,7 @@ def plan_separate_color_pickers(
         plans.append(
             SeparatePickerPlan(
                 picker_name=f"{node_name}__ch{ch_index}",
-                label=label,
+                label=f"{label} {channel_letters[ch_index]}".strip(),
                 channel_index_value=SEPARATE_CHANNEL_INDEX_MAP[ch_index],
                 conversion_value=conversion_value,
                 location=(location[0] + 1650.0, location[1] - ch_index * 150.0),

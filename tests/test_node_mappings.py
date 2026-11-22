@@ -90,6 +90,20 @@ def test_plan_separate_color_pickers_only_for_linked_channels() -> None:
     assert plans[1].picker_name == "Separate Color__ch2"
     assert plans[1].channel_index_value == "3"
     assert plans[1].location == (1750.0, -100.0)
+    assert [plan.label for plan in plans] == ["ORM Split H", "ORM Split V"]
+
+
+def test_plan_separate_color_pickers_label_distinguishes_rgb_channels() -> None:
+    plans = plan_separate_color_pickers(
+        node_name="Separate Color",
+        label=" Metallic",
+        mode="RGB",
+        linked_output_indices=[1, 2],
+        location=(0.0, 0.0),
+    )
+    labels = [plan.label for plan in plans]
+    assert labels == ["Metallic G", "Metallic B"]
+    assert len(set(labels)) == len(labels)
 
 
 def test_resolve_octane_socket_names_and_material_prefix_map() -> None:

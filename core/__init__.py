@@ -9,7 +9,11 @@ from .graph_flattener import (
     flatten_graph_ir,
 )
 from .graph_planner import (
+    ALPHA_MODES,
+    DEFAULT_ALPHA_MODE,
     AlphaClipPlan,
+    AlphaMode,
+    AlphaTrace,
     ConversionWarning,
     SerializedLink,
     SerializedMaterialGraph,
@@ -19,6 +23,7 @@ from .graph_planner import (
     compute_branch_labels,
     find_alpha_clip_source_image,
     plan_alpha_clip_bypass,
+    trace_alpha_source,
 )
 from .node_mappings import (
     BLEND_TYPE_MAPPING,
@@ -60,7 +65,11 @@ from .texture_classifier import (
 
 __all__ = [
     "AUTO_CONNECT_KEYWORD_MAPPING",
+    "ALPHA_MODES",
     "AlphaClipPlan",
+    "AlphaMode",
+    "AlphaTrace",
+    "DEFAULT_ALPHA_MODE",
     "BLEND_TYPE_MAPPING",
     "ConversionWarning",
     "FlattenedGraphResult",
@@ -97,6 +106,7 @@ __all__ = [
     "normalize_preferences_path",
     "parse_color_repr",
     "plan_alpha_clip_bypass",
+    "trace_alpha_source",
     "plan_separate_color_pickers",
     "prepare_preferences_updates",
     "remap_label",
